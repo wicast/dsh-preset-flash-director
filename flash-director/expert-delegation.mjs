@@ -22,8 +22,15 @@ const FALLBACK = {
   expertModel: 'deepseek-v4-pro',
   expertMaxTokens: 8192,
   maxExpertsPerUserTask: 3,
-  briefMaxChars: 12000,
+  briefMaxChars: 40000,
 }
+
+// 单字段上限。evidence 是简报里最重的部分（日志、命令输出、文件摘录），
+// 给最大配额；task 是"一个认知问题"，必须保持紧凑。
+const TASK_MAX = 4000
+const BACKGROUND_MAX_FRACTION = 0.4
+const EVIDENCE_MAX_FRACTION = 0.5
+const SUBJECT_MAX = 2000
 
 // 专家子代理不允许持有的工具：委托链、文件写入、与用户对话、目标、后台
 // 任务、计划模式、todo、skill 加载。bash/read/glob/grep/web_search 保留，
@@ -212,8 +219,13 @@ export default {
         },
       },
       async execute(args, exec) {
+        const fieldMax = {
+          task: TASK_MAX,
+          background: Math.floor(settings.briefMaxChars * BACKGROUND_MAX_FRACTION),
+          evidence: Math.floor(settings.briefMaxChars * EVIDENCE_MAX_FRACTION),
+        }
         for (const field of ['task', 'background', 'evidence']) {
-          const problem = validateStrings(args[field], field, 10, Math.floor(settings.briefMaxChars / 2))
+          const problem = validateStrings(args[field], field, 10, fieldMax[field])
           if (problem !== undefined) return rejectText(problem)
         }
         if (!Array.isArray(args.acceptance) || args.acceptance.filter((a) => typeof a === 'string' && a.trim() !== '').length === 0) {
@@ -246,10 +258,10 @@ export default {
         },
       },
       async execute(args, exec) {
-        for (const field of ['subject', 'content']) {
-          const problem = validateStrings(args[field], field, 10, settings.briefMaxChars)
-          if (problem !== undefined) return rejectText(problem)
-        }
+        const subjectProblem = validateStrings(args.subject, 'subject', 10, SUBJECT_MAX)
+        if (subjectProblem !== undefined) return rejectText(subjectProblem)
+        const contentProblem = validateStrings(args.content, 'content', 10, settings.briefMaxChars)
+        if (contentProblem !== undefined) return rejectText(contentProblem)
         return spawnExpert(args, true, exec)
       },
     }

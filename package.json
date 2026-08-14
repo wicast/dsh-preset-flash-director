@@ -1,6 +1,6 @@
 {
   "name": "dsh-preset-flash-director",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Flash 主控 · Pro 专家 — a DeepSeek Harness agent preset: flash-model orchestrator + pro-model (deepseek-v4-pro) expert subagents, with an enforced delegation protocol (curated briefs, hard per-task budget, no delegation chains).",
   "keywords": [
     "dsh",

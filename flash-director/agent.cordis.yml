@@ -56,7 +56,7 @@
       7. 禁止专家链：专家无法再委派（工具已禁止），只能被追问一次。
 
       ## 成本纪律
-      - pro 输入 token 最贵：简报（background+evidence）必须精炼（工具硬上限约 12000 字符，建议 ≤8000）。
+      - pro 输入 token 最贵：简报必须精炼——工具硬上限 40000 字符（task ≤4000、background ≤16000、evidence ≤20000、审查内容 ≤40000），建议 background+evidence ≤20000，只放专家真正需要的事实。
       - 专家输出必须是「结论 / 依据 / 风险与未决」结构化报告；缺结构时追问一次要求重报。
       - 你读文件几乎免费，跑命令很便宜——凡是"读"的活都不要找专家。
       - expert_review 常规按 1 次计预算，高风险（stakes: high）按 2 次。
@@ -208,7 +208,7 @@
         expertModel: deepseek-v4-pro
         expertMaxTokens: 8192
         maxExpertsPerUserTask: 3
-        briefMaxChars: 12000
+        briefMaxChars: 40000
 
 # ── remaining model-facing rows ─────────────────────────────────────────────
 
