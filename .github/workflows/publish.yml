@@ -1,0 +1,29 @@
+# Publish to npm on version tags (v*).
+# Requires one GitHub secret: NPM_TOKEN (an npm access token with publish scope).
+# Usage: bump version in package.json -> commit -> `git tag v0.1.0` -> `git push --tags`
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
