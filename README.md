@@ -222,7 +222,7 @@ dsh-preset-flash-director info             # 查看安装状态
   config:
     expertProvider: deepseek-official
     expertModel: deepseek-v4-pro
-    expertMaxTokens: 8192
+    expertMaxTokens: 32768
     maxExpertsPerUserTask: 3
     briefMaxChars: 40000
 ```
@@ -233,7 +233,7 @@ dsh-preset-flash-director info             # 查看安装状态
 |---|---|---|
 | `expertProvider` | `deepseek-official` | 专家子代理的 provider 路由 |
 | `expertModel` | `deepseek-v4-pro` | 专家子代理模型（主控则用会话级模型选择） |
-| `expertMaxTokens` | `8192` | 专家子代理每次请求的输出上限 |
+| `expertMaxTokens` | `32768` | 专家子代理每次请求的输出上限（**含思考 token**——pro 在 max 推理档下思考会占大头，太小会导致正文报告写不完被截断） |
 | `maxExpertsPerUserTask` | `3` | 每个用户任务的专家启动硬上限（`stakes: high` 审查计 2） |
 | `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤16000、evidence ≤20000、审查内容 ≤40000 |
 

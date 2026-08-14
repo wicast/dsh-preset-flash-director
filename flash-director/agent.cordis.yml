@@ -206,7 +206,7 @@
       config:
         expertProvider: deepseek-official
         expertModel: deepseek-v4-pro
-        expertMaxTokens: 8192
+        expertMaxTokens: 32768
         maxExpertsPerUserTask: 3
         briefMaxChars: 40000
 

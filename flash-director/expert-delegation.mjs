@@ -20,7 +20,7 @@
 const FALLBACK = {
   expertProvider: 'deepseek-official',
   expertModel: 'deepseek-v4-pro',
-  expertMaxTokens: 8192,
+  expertMaxTokens: 32768,
   maxExpertsPerUserTask: 3,
   briefMaxChars: 40000,
 }
@@ -71,8 +71,9 @@ function expertPersona(kind, reviewer) {
     '2. Do not modify the workspace: never create, edit, or delete files; your bash runs must stay read-only or side-effect-free. All changes are applied by the orchestrator based on your report.',
     '3. Work solo: delegation and background-job tools are unavailable; do not attempt them.',
     '4. Budget discipline: output only what answers the question. No restating the brief, no filler, no exploratory writing.',
-    '5. Structure your final report as: 结论 / 依据 / 风险与未决 / （如适用）建议的下一步。',
-    '6. Final action: when the analysis is complete, call the report tool ONCE with the complete self-contained report text. Never finish the turn without reporting.',
+    '5. Reasoning is internal; the REPORT is the deliverable. Your output budget (max_tokens) covers reasoning + report together — keep reasoning proportionate and ALWAYS finish the 结论 / 依据 / 风险与未决 sections completely. A truncated report is a failed report.',
+    '6. Structure your final report as: 结论 / 依据 / 风险与未决 / （如适用）建议的下一步。',
+    '7. Final action: when the analysis is complete, call the report tool ONCE with the complete self-contained report text. Never finish the turn without reporting.',
   ]
   return [...lines, ...common].filter((line) => line !== '').join('\n')
 }
