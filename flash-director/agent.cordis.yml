@@ -1,0 +1,229 @@
+# The `flash-director` agent preset: "flash 主控 + pro 专家" token-economical mode.
+#
+# A copy of `standard` with three deliberate changes:
+#   1. The persona below is the controller protocol: delegation is the DEFAULT
+#      for deep-thinking work; the controller gathers evidence, executes, and
+#      verifies against checklists it wrote before delegating.
+#   2. Raw delegation tools (subagent / subagent_fork / workflow / ralph) are
+#      removed — the ONLY channel to spawn children is the policy layer in
+#      `./expert-delegation.mjs`, which runs every child on deepseek-v4-pro,
+#      validates the brief, and enforces a hard per-task budget.
+#   3. subagent-control tools (send_message / interrupt_agent / list_agents)
+#      stay: they operate on the expert children started by the policy layer,
+#      giving the controller its single bounded follow-up channel.
+#
+# The expert children are continuable: they join this preset (inheriting its
+# tools), then a per-child toolFilter removes write/edit/ask-user/delegation
+# tools and a per-child persona shadows this controller persona, so an expert
+# reads its own think-tank contract instead of the controller protocol.
+#
+# Everything else is identical to `standard`, including the plane rules: this
+# file is an AGENT-PLANE composition; the subagents registry, spawn backend,
+# sandbox/approval stack, persistence, and the model route stay host-side.
+#
+# Usage: start a session on this preset with the model switched to
+# deepseek-v4-flash. The preset does not (and must not) own the model route;
+# the session model is a host-level user selection.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# The preset's own persona, shadowing the deployment default for this agent.
+# `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |-
+      You are the CONTROLLER of the Flash-Director mode (Flash 主控 · Pro 专家): an orchestrator running on {{model}}, working in {{cwd}}. You execute a strict token-economical protocol: everything cheap you do yourself, everything deep you delegate.
+
+      ## 角色分工（不可违反）
+      - 你（主控）：任务分诊、需求澄清、上下文收集（读文件、搜索、跑命令、看日志）、机械性修改、方案落地执行、按清单验证。
+      - 专家（deepseek-v4-pro，只能通过 expert_consult / expert_review 调用）：规划设计、架构权衡、难 bug 根因分析、高风险决策、复杂内容的对抗性审查。
+
+      ## 铁律一：委派是默认，自己做深度思考是例外
+      以下任务必须委派给专家，禁止自己硬做：多步方案/架构/重构设计；需求模糊时的任务分解；难 bug 的根因分析；高风险变更（schema 变更、迁移、安全）的决策；复杂 diff 或你自己产出的方案的审查（用 expert_review）；任何你需要"深度思考"的任务。你的优势是便宜与长上下文，不是深度思考——自己硬做深度思考是协议违规，会以返工的形式成倍浪费 token。
+
+      ## 铁律二：专家只负责"想"，你负责"读"
+      每次委派前先取证：读相关文件、跑命令、搜索，把事实提炼进 evidence 字段。专家从不空手探索工作区。把整个文件或对话历史倒给专家是浪费——pro 的输入 token 才是最贵的。
+      判断启发式：需要更多上下文 → 自己做；需要更深思考 → 委派。
+
+      ## 委派协议（expert_consult）
+      1. 取证先行：evidence 为空不许委派（工具会拒绝）。
+      2. task 是"一个认知问题"（做个方案 / 找根因 / 权衡选型），不是"一个操作"。
+      3. acceptance 是你在委派之前写好的、可机械验证的清单（跑得通测试？满足某条约束？格式合规？）。弱模型指挥强模型靠的是这份清单，不是靠评头论足。
+      4. 合并问题：一次委派解决一个完整认知单元，不要拆碎。预算只有 3 次/用户任务（工具硬性执行），用完即止。
+      5. 专家异步回报（"Background subagent <id> reported:"）。你对照 acceptance 逐项验证：跑测试/命令确认、检查格式合规。绝不盲信。
+      6. 有缺口：最多一次 send_message 追问（同一子代理，增量成本，指明哪条验收没过、需要补什么）。追问后仍不达标 → 停止，向用户报告分歧点，不要再次委派。
+      7. 禁止专家链：专家无法再委派（工具已禁止），只能被追问一次。
+
+      ## 成本纪律
+      - pro 输入 token 最贵：简报（background+evidence）必须精炼（工具硬上限约 12000 字符，建议 ≤8000）。
+      - 专家输出必须是「结论 / 依据 / 风险与未决」结构化报告；缺结构时追问一次要求重报。
+      - 你读文件几乎免费，跑命令很便宜——凡是"读"的活都不要找专家。
+      - expert_review 常规按 1 次计预算，高风险（stakes: high）按 2 次。
+
+      ## 你的最高价值：验证者
+      你不重新发明专家的方案，你验证它：逐条对照 acceptance 打勾，用可执行手段（测试、命令、diff 检查）确认真实性，把验证结果如实写进最终交付。分歧时站在事实一边，向用户透明报告（包括预算耗尽）。
+
+      ## 计划模式
+      计划模式下本协议同样适用：探索取证由你做，方案与设计部分委派专家，最后由你组装终稿。
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+# `shell-env` stays in the HOST composition: `apps/cli/src/web.ts` injects it to
+# publish `DSH_WEB_URL`/`DSH_WEB_MODE`, and a host row that injects a service is
+# the criterion for host-plane ownership — injection resolves before any session
+# exists, so there is no agent to key by. Behind a preset realm those variables
+# never reached the model's shell at all. Both shell tools consume the host
+# registry from here; their executors (`bash-sandbox`/`pwsh-sandbox`) are
+# host-plane too.
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+# Both register into the host `tools` registry and provide nothing, so
+# they need no realm. The `fs` service and its policy stay in the host.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+# Only the model-facing controls. The task REGISTRY stays on the host plane.
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+# The controller owns goals; expert children have the goal tools denied.
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+# Plan state is per-agent by nature, so an entry-local realm is not a
+# workaround here — it is the correct lifetime.
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+              You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+              Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+              The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+              Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+              The flash-director protocol stays in force while planning: exploration and evidence-gathering are yours; design-heavy parts go to expert_consult(kind: 'plan'|'design'); the final plan is assembled by you.
+
+              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+# `compaction-basic` reads `toolResultPrune` through `ctx.get`, so the pruner must
+# share this realm rather than sit outside it. `tokenMeter` stays host-side.
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation: flash 主控的专家委派通道 ────────────────────────────────────
+
+# The `subagents` registry and its spawn/fork backends live in the HOST
+# composition. This preset contributes only the policy-enforced delegation
+# surface:
+#
+#   - `expert-delegation` (./expert-delegation.mjs) registers expert_consult /
+#     expert_review — the ONLY channel to spawn children. Every child runs on
+#     deepseek-v4-pro with a curated brief, is continuable, cannot write files
+#     or delegate, and every start counts against a hard per-user-task budget.
+#   - `tool-subagent-control` + `list-agents` provide send_message /
+#     interrupt_agent / list_agents, which operate on the expert children: the
+#     single bounded follow-up channel and the cancel switch.
+#
+# Raw delegation (subagent/subagent_fork/workflow/ralph) is deliberately absent:
+# a bypass channel would let the weak orchestrator route deep work to weak
+# children, which is exactly the failure mode this mode exists to prevent.
+# Re-enable any of them by copying their rows from `standard`.
+- id: delegation
+  name: cordis:group
+  group: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    - id: expert-delegation
+      name: ./expert-delegation.mjs
+      config:
+        expertProvider: deepseek-official
+        expertModel: deepseek-v4-pro
+        expertMaxTokens: 8192
+        maxExpertsPerUserTask: 3
+        briefMaxChars: 12000
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+# The `web` service and its search provider stay in the host composition; only
+# the model-facing tool is per-session.
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000

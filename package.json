@@ -1,0 +1,37 @@
+{
+  "name": "dsh-preset-flash-director",
+  "version": "0.1.0",
+  "description": "Flash 主控 · Pro 专家 — a DeepSeek Harness agent preset: flash-model orchestrator + pro-model (deepseek-v4-pro) expert subagents, with an enforced delegation protocol (curated briefs, hard per-task budget, no delegation chains).",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "agent-preset",
+    "flash",
+    "orchestration",
+    "subagent",
+    "token-economy"
+  ],
+  "type": "module",
+  "bin": {
+    "dsh-preset-flash-director": "bin/dsh-preset-flash-director.mjs"
+  },
+  "files": [
+    "bin",
+    "flash-director",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhaoyilun/dsh-preset-flash-director.git"
+  },
+  "homepage": "https://github.com/zhaoyilun/dsh-preset-flash-director",
+  "publishConfig": {
+    "access": "public"
+  }
+}
