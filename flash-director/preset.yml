@@ -1,2 +1,2 @@
 name: Flash 主控 · Pro 专家
-description: 省 token 的"flash 主控 + pro 专家"模式：主控负责分诊、取证、机械执行与验收，规划设计/根因分析/高风险决策等深度思考任务只能通过策略工具（expert_consult / expert_review）委派给 deepseek-v4-pro 专家子代理；简报强制校验 + 硬性预算（每用户任务 3 次）防止弱指挥强。使用本预设时请把会话模型切换为 deepseek-v4-flash。
+description: 省 token 的"flash 主控 + pro 专家"模式：主控负责分诊、取证、机械执行与验收，规划设计/根因分析/高风险决策等深度思考任务只能通过策略工具（expert_consult / expert_review）委派给 deepseek-v4-pro 专家子代理；简报强制校验 + 硬性预算（每用户任务 3 次）防止弱指挥强；同会话内专家按角色复用同一子代理（followup 续聊），少开 subagent、提高缓存命中。使用本预设时请把会话模型切换为 deepseek-v4-flash。

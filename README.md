@@ -40,8 +40,9 @@
 
 - **pro 的输入 token 最贵**：每次委派 = 简报（主控写、专家读）+ pro 生成 + 回传（主控读）。协议强制主控先取证、精炼简报（工具硬上限），专家从不空手探索工作区，也从不接触主控的对话历史。
 - **flash 的上下文便宜**：一切"读"的活（大文件、日志、搜索）都由主控完成，机械修改也在主控侧落地。
+- **会话内复用（省 spawn + 缓存命中）**：默认 `expertReuse: session`——同一会话内专家按角色（咨询/审查）复用同一子代理，连续委派经 `followup` 续聊而非重复新建；整段专家对话成为 provider 前缀缓存的共享前缀，越到后面缓存命中越高，也少开了一堆零散 subagent。轮换上限与失败回落（父实例失效等）由插件自动处理，主控无感。
 - **有界追问**：专家子代理是 continuable 的，验收不通过时可用 `send_message` 做一次增量追问（复用同一上下文，不必重付简报）；二次不达标即停止并向用户报告，杜绝 ping-pong。
-- **硬预算**：每用户任务默认 3 次专家启动（新人类消息自动重置），`stakes: high` 审查计 2 次，用完即拒。
+- **硬预算**：每用户任务默认 3 次专家委派（新人类消息自动重置），`stakes: high` 审查计 2 次，用完即拒。复用与新建同价，轮换不额外计费。
 
 ## 架构
 
@@ -50,9 +51,11 @@
             │  分诊 / 取证 / 机械执行 / 验收
             │
             ├── expert_consult(kind, task, background, evidence, acceptance)
-            │        │  简报校验（必填+有界）→ 预算记账 → startContinuable
+            │        │  简报校验（必填+有界）→ 预算记账 → 会话内复用决策
+            │        │    · 复用：同一角色 child 存在且未达轮换上限 → followup 续聊
+            │        │    · 新建：无 child / 轮换上限 / followup 失败 → startContinuable
             │        ▼
-            │   pro 专家子代理（deepseek-v4-pro，continuable）
+            │   pro 专家子代理（deepseek-v4-pro，continuable，按角色复用）
             │        · per-child persona：只"想"不"读"、结构化报告、必须 report
             │        · toolFilter 摘除：委派/写入/问人/后台任务/目标 等工具
             │        · 异步回报 "Background subagent <id> reported:"
@@ -64,10 +67,15 @@
 
 关键机制（全部在策略插件内硬性执行，不靠模型自觉）：
 
-1. **简报校验**：`task`/`background`/`evidence`/`acceptance` 必填且有界（简报整体 ≤40000，task ≤4000、background ≤16000、evidence ≤20000），超大即拒绝。
-2. **预算账本**：按 agent 记账，`agent/pre-step` 检测到新人类消息（`source.kind === 'user'`）时清零。
-3. **禁止专家链**：专家子代理被摘除一切委派/写入工具，只能通过 `bash`/`read` 等低成本手段验证假设，不能修改工作区。
-4. **验收循环**：主控在委派**之前**写好 `acceptance` 清单，专家回报后逐项机械验证（跑测试/命令/查格式），这是"弱指挥强"的支点。
+1. **简报校验**：`task`/`background`/`evidence`/`acceptance` 必填且有界（简报整体 ≤40000，task ≤4000、background ≤14000、evidence ≤18000），超大即拒绝。三字段配额之和刻意留出头尾余量，各字段到顶时拼装后仍不超整体上限。
+2. **预算账本**：按 agent 记账，`agent/pre-step` 检测到新人类消息（`source.kind === 'user'`）时清零；每个认知委派计 1 次（`stakes: high` 计 2），复用与新建同价、轮换不额外计费；先记账后尝试、失败退款。
+3. **会话内复用（默认开启）**：同一会话内按角色（咨询/审查）各复用同一子代理——连续委派经 `followup` 续聊而非重复新建，整段对话成为前缀缓存共享前缀；`reuseMaxFollowups` 轮换上限防上下文无限膨胀；followup 失败（父实例失效/不可恢复等）自动回落为新建，并禁用本任务的复用（下条人类消息重试）。
+4. **禁止专家链**：专家子代理被摘除一切委派/写入工具，只能通过 `bash`/`read` 等低成本手段验证假设，不能修改工作区。
+5. **验收循环**：主控在委派**之前**写好 `acceptance` 清单，专家回报后逐项机械验证（跑测试/命令/查格式），这是"弱指挥强"的支点。
+
+> **`send_message` 是独立旁路通道（软约束）**：全局 `send_message` 直接对专家 child 调 `followup`，**不计入 `reuseMaxFollowups` 轮换、也不消耗预算**。协议/persona 硬性规定每轮委派至多一次追问（"最多一次 send_message 追问"），这是行为约束而非机制强制——请勿用它无限续聊同一个专家，否则上下文膨胀防护会被绕过。`expert_consult`/`expert_review` 内部的内置续聊（复用）则严格受轮换与预算约束。
+
+> **宿主前置**：专家靠 `report` 工具回报，该工具由 DSH 宿主平面（`tool-subagent-report`）注入到每个 continuable 子代理作用域；使用本预设要求宿主包含它（DeepSeek Harness 官方宿主默认包含）。缺失时专家会退回"以最终消息作为报告"交付。
 
 ## 协议摘要
 
@@ -133,8 +141,8 @@ dsh-preset-flash-director info             # 查看安装状态
 |---|---|---|
 | `kind` | `plan` / `design` / `debug` / `analysis` 四选一，决定专家侧重点 | — |
 | `task` | **一个认知问题**，不是操作。❌"重构 payment.ts" → ✅"支付模块当前分层是否合理？给出拆分方案与迁移路径" | 4000 |
-| `background` | 现状、已尝试过什么、已知约束 | 16000 |
-| `evidence` | 主控已收集的事实：文件关键片段、命令输出、日志摘录。**放摘录不放整文件** | 20000 |
+| `background` | 现状、已尝试过什么、已知约束 | 14000 |
+| `evidence` | 主控已收集的事实：文件关键片段、命令输出、日志摘录。**放摘录不放整文件** | 18000 |
 | `constraints` | 硬约束列表（可不填） | — |
 | `acceptance` | **委派之前**写好的、可机械验证的清单，≥1 条 | — |
 
@@ -192,12 +200,12 @@ dsh-preset-flash-director info             # 查看安装状态
 ### 用 `expert_review` 审查（元认知循环）
 
 - 适用：高风险变更上线前（DB schema 变更、迁移、安全改动）；你对专家方案有疑虑时（用它审专家的方案 = 双专家把关）；你自己的设计/计划/diff 交付前。
-- `subject` 一句话说明审什么；`content` 放完整材料（≤40000）；`criteria` 放你的具体疑虑；`stakes: high` 表示不可逆变更（计 2 次预算）。
+- `subject` 一句话说明审什么；`content` 放完整材料（≤36000）；`criteria` 放你的具体疑虑；`stakes: high` 表示不可逆变更（计 2 次预算）。`content` 上限为整体上限扣除 subject 与头尾余量，避免"字段通过而拼装后超限"。
 - 收到审查报告后：**逐条处理 blocking 意见**，落实 must-fix 清单，裁定为"通过"才继续（或用户明确豁免）。
 
 ### 预算行为实例
 
-- 默认每用户任务 **3 次**专家启动；`expert_review(stakes: high)` 计 **2 次**；新用户消息到达自动重置。
+- 默认每用户任务 **3 次**专家委派；`expert_review(stakes: high)` 计 **2 次**；新用户消息到达自动重置。会话内复用（followup）与新建同价，轮换不额外计费。
 - 例：一个服务拆分任务，`design(1) + review(high, 2) = 3`，正好用满；同一任务内再想委派会被 `budget-exhausted` 拒绝，主控自行收尾并告知你。
 - 想放宽：把 `agent.cordis.yml` 里 `expert-delegation` 行的 `maxExpertsPerUserTask` 调大（见下）。
 
@@ -225,6 +233,8 @@ dsh-preset-flash-director info             # 查看安装状态
     expertMaxTokens: 32768
     maxExpertsPerUserTask: 3
     briefMaxChars: 40000
+    expertReuse: session
+    reuseMaxFollowups: 8
 ```
 
 ## 配置
@@ -234,8 +244,10 @@ dsh-preset-flash-director info             # 查看安装状态
 | `expertProvider` | `deepseek-official` | 专家子代理的 provider 路由 |
 | `expertModel` | `deepseek-v4-pro` | 专家子代理模型（主控则用会话级模型选择） |
 | `expertMaxTokens` | `32768` | 专家子代理每次请求的输出上限（**含思考 token**——pro 在 max 推理档下思考会占大头，太小会导致正文报告写不完被截断） |
-| `maxExpertsPerUserTask` | `3` | 每个用户任务的专家启动硬上限（`stakes: high` 审查计 2） |
-| `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤16000、evidence ≤20000、审查内容 ≤40000 |
+| `maxExpertsPerUserTask` | `3` | 每个用户任务的专家委派硬上限（`stakes: high` 审查计 2；复用与新建同价，轮换不额外计费） |
+| `expertReuse` | `session` | 专家子代理复用范围：`session`（同会话内按角色复用同一子代理，后续委派 followup 续聊而非新建，少开 subagent、提高前缀缓存命中；失败自动回落为新建）或 `off`（每次新建，等同旧行为） |
+| `reuseMaxFollowups` | `8` | 单个复用 child 的 followup 轮换上限，达到后强制新建并替换该角色的子代理（防上下文无限膨胀；轮换不额外计预算）。调大 = 更多复用/缓存命中，但单条对话更长，逼近上下文上限时会被 compaction 打断前缀——按实际简报规模调整即可 |
+| `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000（字段配额之和预留头尾余量） |
 
 ## 卸载
 
@@ -250,6 +262,8 @@ rm -rf ~/.dsh/.agent-presets/flash-director    # 或 dsh-preset-flash-director u
 | 委派返回 `rejected` | 简报缺字段或超限：按返回信息补全/精炼 `evidence`、`background`、`acceptance` 后重试（上限见配置表） |
 | 委派返回 `budget-exhausted` | 本用户任务预算耗尽：主控自行收尾并告知用户；新消息后自动重置；或调大 `maxExpertsPerUserTask` |
 | 专家迟迟不回报 | `list_agents` 查看状态；跑飞可用 `interrupt_agent` 止损；确认模型 id 正确（无效模型会让子代理报错） |
+| 同一会话内 `reused` 一直为 `false`（没在复用） | 可能原因：轮换达到 `reuseMaxFollowups`、consult/review 角色交替（各用各的 child）、或本任务内 followup 已失败（父实例失效）被临时禁用。插件会自动回落为新建，功能不受影响；下一条人类消息会重试复用 |
+| 想彻底关闭复用 | 把 `agent.cordis.yml` 里 `expert-delegation` 行的 `expertReuse` 改为 `off`（等同旧行为：每次新建子代理） |
 | 工具列表没有 `expert_consult` | 预设未安装（重跑安装脚本）或会话未重建（新开会话） |
 | 主控好像没在委派、自己在硬做设计 | 那是协议违规：提醒它"深度思考任务必须走 expert_consult/expert_review"；仍不改就换回标准模式 |
 | 不想用 flash 主控 | 该预设也兼容 pro 主控（只是省 token 效果打折）；或换回标准模式 |

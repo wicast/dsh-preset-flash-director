@@ -54,9 +54,10 @@
       5. 专家异步回报（"Background subagent <id> reported:"）。你对照 acceptance 逐项验证：跑测试/命令确认、检查格式合规。绝不盲信。
       6. 有缺口：最多一次 send_message 追问（同一子代理，增量成本，指明哪条验收没过、需要补什么）。追问后仍不达标 → 停止，向用户报告分歧点，不要再次委派。
       7. 禁止专家链：专家无法再委派（工具已禁止），只能被追问一次。
+      8. 会话内复用（expertReuse 默认 session）：同一会话内专家按角色（咨询/审查）复用同一子代理，连续委派自动 followup 续聊而非新建，少开 subagent、提高缓存命中；轮换与失败回落由插件自动处理，你无需干预，报告仍以 "Background subagent <id> reported:" 异步到达。
 
       ## 成本纪律
-      - pro 输入 token 最贵：简报必须精炼——工具硬上限 40000 字符（task ≤4000、background ≤16000、evidence ≤20000、审查内容 ≤40000），建议 background+evidence ≤20000，只放专家真正需要的事实。
+      - pro 输入 token 最贵：简报必须精炼——工具硬上限 40000 字符（task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000；三字段配额之和预留了头尾余量，各字段到顶时拼装后仍在 40000 内），建议 background+evidence ≤20000，只放专家真正需要的事实。
       - 专家输出必须是「结论 / 依据 / 风险与未决」结构化报告；缺结构时追问一次要求重报。
       - 你读文件几乎免费，跑命令很便宜——凡是"读"的活都不要找专家。
       - expert_review 常规按 1 次计预算，高风险（stakes: high）按 2 次。
@@ -182,7 +183,11 @@
 #   - `expert-delegation` (./expert-delegation.mjs) registers expert_consult /
 #     expert_review — the ONLY channel to spawn children. Every child runs on
 #     deepseek-v4-pro with a curated brief, is continuable, cannot write files
-#     or delegate, and every start counts against a hard per-user-task budget.
+#     or delegate, and every delegation counts against a hard per-user-task
+#     budget. In the default session-reuse mode (`expertReuse: session`) the
+#     same child is reused per role via followup instead of being re-spawned
+#     (fewer subagents, higher provider cache-hit rate), up to
+#     `reuseMaxFollowups` rotations per child.
 #   - `tool-subagent-control` + `list-agents` provide send_message /
 #     interrupt_agent / list_agents, which operate on the expert children: the
 #     single bounded follow-up channel and the cancel switch.
@@ -209,6 +214,8 @@
         expertMaxTokens: 32768
         maxExpertsPerUserTask: 3
         briefMaxChars: 40000
+        expertReuse: session
+        reuseMaxFollowups: 8
 
 # ── remaining model-facing rows ─────────────────────────────────────────────
 
