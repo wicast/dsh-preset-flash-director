@@ -27,9 +27,80 @@
 //   - child 空闲后其 Activation 由宿主 dispose（session 持久化），后续 followup
 //     自动 cold resume；我们不主动 drain，只从池里摘记。
 //
-// 零导入：服务走 inject，schema 是纯 JSON Schema。默认模型/预算可被组合行
-// 的 config 覆盖（expertProvider/expertModel/expertMaxTokens/
-// maxExpertsPerUserTask/briefMaxChars/expertReuse/reuseMaxFollowups）。
+// 零依赖（仅 node 内置模块）：服务走 inject，schema 是纯 JSON Schema。默认
+// 模型/预算可被组合行的 config 覆盖（expertProvider/expertModel/expertMaxTokens/
+// maxExpertsPerUserTask/briefMaxChars/expertReuse/reuseMaxFollowups），并可在
+// 运行期用模块同目录的 `expert-delegation.config.json` 热覆盖——无需重启 DSH，
+// 旧会话下一次委派即生效；改 expertProvider/expertModel/expertMaxTokens 会让
+// 已复用的旧 child 指纹失配而自动轮换为新建（新模型生效）。
+
+// ── 热加载覆盖配置（无需重启 DSH，下次委派即生效）──
+// 优先级：`expert-delegation.config.json`（模块同目录，或 $FLASH_DIRECTOR_CONFIG
+// 指定路径）> 组合行 config（agent.cordis.yml 传入 apply）> FALLBACK。
+// 每次委派解析一次（mtime 缓存省去未变时的重读）；文件缺失/畸形安全回落。
+// 改 expertProvider/expertModel/expertMaxTokens 会让既有复用 child 指纹失配
+// → 强制新建（新模型生效）；其余键（reuseMaxFollowups/maxExpertsPerUserTask/
+// briefMaxChars/expertReuse）即时生效、不触发重建。
+import { readFile, stat } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const CONFIG_PATH = process.env.FLASH_DIRECTOR_CONFIG
+  ? process.env.FLASH_DIRECTOR_CONFIG
+  : join(dirname(fileURLToPath(import.meta.url)), 'expert-delegation.config.json')
+// 本预设组合行（agent.cordis.yml）只 apply 本插件一次；若同一模块被多次
+// apply（多行引用或热重载），最后一次 config 会作为全局基线生效——当前无此
+// 场景，此前提仅作文档声明。
+let cordisConfig = {}
+let overridesCache = { mtimeMs: -1, values: null }
+let lastConfigError = null
+
+// spawn 指纹 = 决定 child 构造的键（provider/model/maxTokens）。用 JSON 序列化
+// 避免分隔符碰撞；指纹变化 → 既有复用 child 轮换为新建（config-drift）。
+function fingerprintOf(s) {
+  return JSON.stringify([s.expertProvider, s.expertModel, s.expertMaxTokens])
+}
+
+// 解析一次有效配置：FALLBACK ← cordis ← 覆盖文件，逐键按与 apply 相同的规则校验。
+async function resolveSettings() {
+  const merged = { ...FALLBACK, ...cordisConfig }
+  try {
+    const fileStat = await stat(CONFIG_PATH)
+    if (overridesCache.mtimeMs !== fileStat.mtimeMs) {
+      let values = null
+      try {
+        const parsed = JSON.parse(await readFile(CONFIG_PATH, 'utf8'))
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          values = parsed
+          lastConfigError = null
+        } else {
+          lastConfigError = 'expert-delegation.config.json must be a JSON object'
+          console.warn('[flash-director] ' + lastConfigError)
+        }
+      } catch (error) {
+        lastConfigError = `expert-delegation.config.json invalid JSON: ${String(error && error.message ? error.message : error)}`
+        console.warn('[flash-director] ' + lastConfigError)
+      }
+      overridesCache = { mtimeMs: fileStat.mtimeMs, values }
+    }
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      overridesCache = { mtimeMs: -1, values: null }
+      lastConfigError = null
+    }
+    // 其它 stat 错误：静默保留当前缓存
+  }
+  if (overridesCache.values !== null) Object.assign(merged, overridesCache.values)
+  return {
+    expertProvider: typeof merged.expertProvider === 'string' ? merged.expertProvider : FALLBACK.expertProvider,
+    expertModel: typeof merged.expertModel === 'string' ? merged.expertModel : FALLBACK.expertModel,
+    expertMaxTokens: Number.isInteger(merged.expertMaxTokens) ? merged.expertMaxTokens : FALLBACK.expertMaxTokens,
+    maxExpertsPerUserTask: Number.isInteger(merged.maxExpertsPerUserTask) ? merged.maxExpertsPerUserTask : FALLBACK.maxExpertsPerUserTask,
+    briefMaxChars: Number.isInteger(merged.briefMaxChars) ? merged.briefMaxChars : FALLBACK.briefMaxChars,
+    expertReuse: merged.expertReuse === 'off' || merged.expertReuse === 'session' ? merged.expertReuse : FALLBACK.expertReuse,
+    reuseMaxFollowups: Number.isInteger(merged.reuseMaxFollowups) && merged.reuseMaxFollowups > 0 ? merged.reuseMaxFollowups : FALLBACK.reuseMaxFollowups,
+  }
+}
 
 const FALLBACK = {
   expertProvider: 'deepseek-official',
@@ -159,16 +230,9 @@ export default {
   name: 'flash-director-expert-delegation',
   inject: ['tools', 'subagents'],
   apply(ctx, config) {
-    const c = config ?? {}
-    const settings = {
-      expertProvider: typeof c.expertProvider === 'string' ? c.expertProvider : FALLBACK.expertProvider,
-      expertModel: typeof c.expertModel === 'string' ? c.expertModel : FALLBACK.expertModel,
-      expertMaxTokens: Number.isInteger(c.expertMaxTokens) ? c.expertMaxTokens : FALLBACK.expertMaxTokens,
-      maxExpertsPerUserTask: Number.isInteger(c.maxExpertsPerUserTask) ? c.maxExpertsPerUserTask : FALLBACK.maxExpertsPerUserTask,
-      briefMaxChars: Number.isInteger(c.briefMaxChars) ? c.briefMaxChars : FALLBACK.briefMaxChars,
-      expertReuse: c.expertReuse === 'off' || c.expertReuse === 'session' ? c.expertReuse : FALLBACK.expertReuse,
-      reuseMaxFollowups: Number.isInteger(c.reuseMaxFollowups) && c.reuseMaxFollowups > 0 ? c.reuseMaxFollowups : FALLBACK.reuseMaxFollowups,
-    }
+    // 组合行 config（agent.cordis.yml）作为基线；运行期每次委派由
+    // resolveSettings() 再合并覆盖文件动态解析，不再冻结为单次快照。
+    cordisConfig = config ?? {}
 
     // 预算账本，按 agent 记账；新的人类消息进入 step 时清零（"用户任务"边界）。
     // 同时清除本任务的 followupDisabled 标记（下个任务重试复用）。
@@ -211,11 +275,11 @@ export default {
       return undefined
     }
 
-    function budgetInfo(ledger) {
-      return { used: ledger.used, limit: settings.maxExpertsPerUserTask, remaining: settings.maxExpertsPerUserTask - ledger.used }
+    function budgetInfo(ledger, s) {
+      return { used: ledger.used, limit: s.maxExpertsPerUserTask, remaining: s.maxExpertsPerUserTask - ledger.used }
     }
 
-    function delegatedResult(childId, messageId, reviewer, ledger, extra) {
+    function delegatedResult(childId, messageId, reviewer, ledger, s, extra) {
       const reused = extra?.reused === true
       const roleLabel = reviewer ? 'reviewer' : 'expert'
       const next = reused
@@ -225,19 +289,28 @@ export default {
         status: 'delegated',
         childId,
         messageId,
-        budget: budgetInfo(ledger),
+        budget: budgetInfo(ledger, s),
         next,
+        // 覆盖文件畸形/非法时把诊断带给控制器，避免"改了没生效"却无信号
+        ...(lastConfigError !== null ? { configError: lastConfigError } : {}),
         ...extra,
       }
     }
 
     // 会话内复用决策。返回 'followup'（复用该 child）或 'spawn'（新建）。
-    function decideReuse(reviewer, agentKey) {
-      if (settings.expertReuse !== 'session') return { action: 'spawn', reason: 'reuse-off' }
+    // s 是本次委派解析的一次性有效配置快照（含热覆盖）。
+    function decideReuse(reviewer, agentKey, s) {
+      if (s.expertReuse !== 'session') return { action: 'spawn', reason: 'reuse-off' }
       if (followupDisabled.has(agentKey)) return { action: 'spawn', reason: 'followup-disabled' }
       const entry = poolSlot(agentKey, reviewer)
       if (entry === undefined) return { action: 'spawn', reason: 'no-pool-entry' }
-      if (entry.followups >= settings.reuseMaxFollowups) return { action: 'spawn', reason: 'rotation-cap' }
+      // 配置漂移：spawn 指纹键（provider/model/maxTokens）变了 → 旧 child 的
+      // 模型已过时，清槽新建（与 followupDisabled 语义无关，只是轮换）。
+      if (entry.fingerprint !== fingerprintOf(s)) {
+        clearPoolSlot(agentKey, reviewer)
+        return { action: 'spawn', reason: 'config-drift' }
+      }
+      if (entry.followups >= s.reuseMaxFollowups) return { action: 'spawn', reason: 'rotation-cap' }
       return { action: 'followup', entry, reason: 'reuse' }
     }
 
@@ -256,8 +329,8 @@ export default {
       }
     }
 
-    // 新建一个专家子代理（fresh spawn），并写入该角色的池 slot。
-    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost) {
+    // 新建一个专家子代理（fresh spawn），并写入该角色的池 slot（含 spawn 指纹）。
+    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost, s) {
       ledger.used += cost
       try {
         const started = await ctx.subagents.startContinuable({
@@ -269,49 +342,54 @@ export default {
             prompt: [textBlock(brief)],
             parent,
             agentOptions: {
-              provider: settings.expertProvider,
-              model: settings.expertModel,
-              maxTokens: settings.expertMaxTokens,
+              provider: s.expertProvider,
+              model: s.expertModel,
+              maxTokens: s.expertMaxTokens,
             },
             persona: expertPersona(reviewer),
             toolFilter: { deny: DENY_TOOLS },
           },
           signal: exec.signal,
         })
-        setPoolSlot(agentKeyOf(parent), reviewer, { childId: started.childId, followups: 0 })
-        return delegatedResult(started.childId, started.messageId, reviewer, ledger, { reused: false, cost })
+        setPoolSlot(agentKeyOf(parent), reviewer, {
+          childId: started.childId,
+          followups: 0,
+          fingerprint: fingerprintOf(s),
+        })
+        return delegatedResult(started.childId, started.messageId, reviewer, ledger, s, { reused: false, cost })
       } catch (error) {
         ledger.used -= cost
         return { status: 'failed', error: String(error && error.message ? error.message : error) }
       }
     }
 
-    // 统一委派入口：预算闸门 → 会话内复用决策 → followup 优先、失败回落新建。
-    async function spawnExpert(args, reviewer, exec) {
+    // 统一委派入口：解析有效配置 → 预算闸门 → 会话内复用决策 → followup 优先、失败回落新建。
+    // s 由调用方（工具 execute）解析一次并下传，保证一次委派内键一致。
+    async function spawnExpert(args, reviewer, exec, s) {
       const parent = exec.agent
       if (!parent) return rejectText('expert delegation requires a calling agent (exec.agent was undefined)')
       const brief = buildBrief(args, reviewer)
-      if (brief.length > settings.briefMaxChars) {
+      if (brief.length > s.briefMaxChars) {
         const curate = reviewer ? 'subject/content' : 'background/evidence'
-        return rejectText(`brief is ${brief.length} chars (limit ${settings.briefMaxChars}): curate ${curate} and keep only the facts the expert needs`)
+        return rejectText(`brief is ${brief.length} chars (limit ${s.briefMaxChars}): curate ${curate} and keep only the facts the expert needs`)
       }
       const agentKey = agentKeyOf(parent)
       const ledger = ledgerOf(agentKey)
       const cost = reviewer && args.stakes === 'high' ? 2 : 1
-      if (ledger.used + cost > settings.maxExpertsPerUserTask) {
+      if (ledger.used + cost > s.maxExpertsPerUserTask) {
         return {
           status: 'budget-exhausted',
-          budget: budgetInfo(ledger),
+          budget: budgetInfo(ledger, s),
           instruction: 'Expert budget for this user task is exhausted. Finish with your own best effort and tell the user the budget was hit; do not delegate again until the user sends a new message.',
         }
       }
 
-      const decision = decideReuse(reviewer, agentKey)
+      const decision = decideReuse(reviewer, agentKey, s)
       if (decision.action === 'followup') {
         ledger.used += cost
         const outcome = await attemptFollowup(decision.entry, brief, parent, exec)
         if (outcome !== null) {
-          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, { reused: true, cost })
+          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, s, { reused: true, cost })
         }
         // followup 失败：退款、禁用本任务复用、清掉坏 slot，回落为新建。
         ledger.used -= cost
@@ -319,7 +397,7 @@ export default {
         clearPoolSlot(agentKey, reviewer)
       }
 
-      return spawnFresh(reviewer, brief, parent, exec, ledger, cost)
+      return spawnFresh(reviewer, brief, parent, exec, ledger, cost, s)
     }
 
     const consult = {
@@ -344,10 +422,11 @@ export default {
         },
       },
       async execute(args, exec) {
+        const s = await resolveSettings()
         const fieldMax = {
           task: TASK_MAX,
-          background: Math.floor(settings.briefMaxChars * BACKGROUND_MAX_FRACTION),
-          evidence: Math.floor(settings.briefMaxChars * EVIDENCE_MAX_FRACTION),
+          background: Math.floor(s.briefMaxChars * BACKGROUND_MAX_FRACTION),
+          evidence: Math.floor(s.briefMaxChars * EVIDENCE_MAX_FRACTION),
         }
         for (const field of ['task', 'background', 'evidence']) {
           const problem = validateStrings(args[field], field, 10, fieldMax[field])
@@ -359,7 +438,7 @@ export default {
         if (typeof args.kind !== 'string' || !Object.prototype.hasOwnProperty.call(KIND_FOCUS, args.kind)) {
           return rejectText('kind must be one of plan/design/debug/analysis')
         }
-        return spawnExpert(args, false, exec)
+        return spawnExpert(args, false, exec, s)
       },
     }
 
@@ -383,13 +462,14 @@ export default {
         },
       },
       async execute(args, exec) {
+        const s = await resolveSettings()
         const subjectProblem = validateStrings(args.subject, 'subject', 10, SUBJECT_MAX)
         if (subjectProblem !== undefined) return rejectText(subjectProblem)
         // content 上限为 briefMaxChars 扣除头尾余量，避免"字段通过而拼装后超限"的二次误拒。
-        const contentMax = Math.max(SUBJECT_MAX + 10, settings.briefMaxChars - REVIEW_CONTENT_HEADROOM)
+        const contentMax = Math.max(SUBJECT_MAX + 10, s.briefMaxChars - REVIEW_CONTENT_HEADROOM)
         const contentProblem = validateStrings(args.content, 'content', 10, contentMax)
         if (contentProblem !== undefined) return rejectText(contentProblem)
-        return spawnExpert(args, true, exec)
+        return spawnExpert(args, true, exec, s)
       },
     }
 

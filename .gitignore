@@ -2,3 +2,5 @@ node_modules/
 *.tgz
 *.bak-*
 .DS_Store
+# 本地运行期覆盖配置（不入库；模板 expert-delegation.config.example.json 保留）
+flash-director/expert-delegation.config.json

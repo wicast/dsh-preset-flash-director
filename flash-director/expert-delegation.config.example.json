@@ -1,0 +1,9 @@
+{
+  "expertProvider": "deepseek-official",
+  "expertModel": "deepseek-v4-pro",
+  "expertMaxTokens": 32768,
+  "maxExpertsPerUserTask": 3,
+  "briefMaxChars": 40000,
+  "expertReuse": "session",
+  "reuseMaxFollowups": 8
+}

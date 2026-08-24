@@ -31,7 +31,8 @@
 | 文件 | 作用 |
 |---|---|
 | `flash-director/agent.cordis.yml` | 组合文件：controller persona 协议 + 行裁剪（移除裸 `subagent`/`subagent_fork`/`workflow`/`ralph`） |
-| `flash-director/expert-delegation.mjs` | 预设本地策略插件（零依赖）：`expert_consult` / `expert_review` 工具 + 简报校验 + 预算账本 |
+| `flash-director/expert-delegation.mjs` | 预设本地策略插件（零依赖）：`expert_consult` / `expert_review` 工具 + 简报校验 + 预算账本 + 会话内复用 + 热加载配置 |
+| `flash-director/expert-delegation.config.example.json` | 热加载覆盖配置的模板（复制为 `expert-delegation.config.json` 后编辑；不入库） |
 | `flash-director/preset.yml` | 名册元数据（名称/描述） |
 
 核心设计：**委派是默认，主控自己做深度思考是例外**。所有"深思考"工作（规划设计、架构权衡、根因分析、高风险决策、对抗性审查）只能走 `expert_consult` / `expert_review`，且专家固定跑 `deepseek-v4-pro`；主控负责读文件、跑命令、机械修改、按预写清单验证。
@@ -222,7 +223,7 @@ dsh-preset-flash-director info             # 查看安装状态
 
 ### 模型适配
 
-默认专家模型为 `deepseek-official` / `deepseek-v4-pro`。若你的部署模型 id 不同，改 `flash-director/agent.cordis.yml` 中 `expert-delegation` 行的 config（插件有同值兜底）：
+默认专家模型为 `deepseek-official` / `deepseek-v4-pro`。若你的部署模型 id 不同，改 `flash-director/agent.cordis.yml` 中 `expert-delegation` 行的 config（插件有同值兜底）。**运行期换模型更推荐用热加载覆盖文件**（见「配置 → 热加载覆盖配置」）：改 `expert-delegation.config.json` 的 `expertModel` 保存即生效，旧会话下一轮委派自动新建新模型子代理，不用开新会话：
 
 ```yaml
 - id: expert-delegation
@@ -249,6 +250,25 @@ dsh-preset-flash-director info             # 查看安装状态
 | `reuseMaxFollowups` | `8` | 单个复用 child 的 followup 轮换上限，达到后强制新建并替换该角色的子代理（防上下文无限膨胀；轮换不额外计预算）。调大 = 更多复用/缓存命中，但单条对话更长，逼近上下文上限时会被 compaction 打断前缀——按实际简报规模调整即可 |
 | `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000（字段配额之和预留头尾余量） |
 
+### 热加载覆盖配置（不用重启 DSH，旧会话下一轮生效）
+
+上面 7 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
+
+用法：
+
+```bash
+# 在安装目录（或仓库）里从模板复制一份再编辑：
+cp flash-director/expert-delegation.config.example.json flash-director/expert-delegation.config.json
+# 编辑任意键（JSON 不支持注释），保存即下次委派生效。
+```
+
+关键行为：
+
+- **换 pro 模型**：改 `expertModel`（或 `expertProvider`/`expertMaxTokens`）后，下一轮委派会把该角色**已复用的旧 child 轮换为新建**、改用新模型（旧 child 不删除，空闲后由宿主回收）。原因：专家子代理的模型在创建时固定并持久化，平台 cold-resume 会原样重放，所以必须新建才能换模型——插件已自动处理，你只改文件即可。
+- **即时生效、不重建**：`reuseMaxFollowups`、`maxExpertsPerUserTask`、`briefMaxChars`、`expertReuse`（开/关复用）改后立即影响后续委派，不动已有 child。
+- **定位**：默认读模块同目录（安装后即 `~/.dsh/.agent-presets/flash-director/expert-delegation.config.json`）；也可用环境变量 `FLASH_DIRECTOR_CONFIG=/path/to/file.json` 指到任意路径。
+- 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。
+
 ## 卸载
 
 ```bash
@@ -263,7 +283,9 @@ rm -rf ~/.dsh/.agent-presets/flash-director    # 或 dsh-preset-flash-director u
 | 委派返回 `budget-exhausted` | 本用户任务预算耗尽：主控自行收尾并告知用户；新消息后自动重置；或调大 `maxExpertsPerUserTask` |
 | 专家迟迟不回报 | `list_agents` 查看状态；跑飞可用 `interrupt_agent` 止损；确认模型 id 正确（无效模型会让子代理报错） |
 | 同一会话内 `reused` 一直为 `false`（没在复用） | 可能原因：轮换达到 `reuseMaxFollowups`、consult/review 角色交替（各用各的 child）、或本任务内 followup 已失败（父实例失效）被临时禁用。插件会自动回落为新建，功能不受影响；下一条人类消息会重试复用 |
-| 想彻底关闭复用 | 把 `agent.cordis.yml` 里 `expert-delegation` 行的 `expertReuse` 改为 `off`（等同旧行为：每次新建子代理） |
+| 想彻底关闭复用 | 把 `agent.cordis.yml` 里 `expert-delegation` 行的 `expertReuse` 改为 `off`（等同旧行为：每次新建子代理）；运行期可用热加载文件的 `expertReuse: "off"` 立即关闭 |
+| 改了 `expertModel` 但委派结果里 `reused` 还是 `true` | 检查覆盖文件是否被读到（路径：模块同目录 `expert-delegation.config.json` 或 `$FLASH_DIRECTOR_CONFIG`；保存后**下一次委派**才生效）；该角色旧 child 会在指纹失配时自动轮换新建——若 `reused=true` 说明指纹没变，确认改动的是 `expertModel`/`expertProvider`/`expertMaxTokens` 三键之一 |
+| 覆盖文件写坏了 | JSON 畸形/非对象 → 安全回落到最后可用配置，委派照常（不会抛错打断工具）；修好文件（mtime 变化）后下次委派自动恢复 |
 | 工具列表没有 `expert_consult` | 预设未安装（重跑安装脚本）或会话未重建（新开会话） |
 | 主控好像没在委派、自己在硬做设计 | 那是协议违规：提醒它"深度思考任务必须走 expert_consult/expert_review"；仍不改就换回标准模式 |
 | 不想用 flash 主控 | 该预设也兼容 pro 主控（只是省 token 效果打折）；或换回标准模式 |
