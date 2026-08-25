@@ -5,5 +5,6 @@
   "maxExpertsPerUserTask": 3,
   "briefMaxChars": 40000,
   "expertReuse": "session",
-  "reuseMaxFollowups": 8
+  "reuseMaxFollowups": 8,
+  "expertReasoningEffort": "high"
 }

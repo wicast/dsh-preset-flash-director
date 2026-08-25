@@ -29,10 +29,12 @@
 //
 // 零依赖（仅 node 内置模块）：服务走 inject，schema 是纯 JSON Schema。默认
 // 模型/预算可被组合行的 config 覆盖（expertProvider/expertModel/expertMaxTokens/
-// maxExpertsPerUserTask/briefMaxChars/expertReuse/reuseMaxFollowups），并可在
-// 运行期用模块同目录的 `expert-delegation.config.json` 热覆盖——无需重启 DSH，
-// 旧会话下一次委派即生效；改 expertProvider/expertModel/expertMaxTokens 会让
-// 已复用的旧 child 指纹失配而自动轮换为新建（新模型生效）。
+// maxExpertsPerUserTask/briefMaxChars/expertReuse/reuseMaxFollowups/
+// expertReasoningEffort），并可在运行期用模块同目录的 `expert-delegation.config.json`
+// 热覆盖——无需重启 DSH，旧会话下一次委派即生效；改 expertProvider/expertModel/
+// expertMaxTokens 会让已复用的旧 child 指纹失配而自动轮换为新建（新模型生效）。
+// expertReasoningEffort（off|low|high|max，缺省继承）经 agent/request 瀑布注入
+// 专家子代理的请求配置，改热加载文件后该 child 下一请求即生效、不轮换。
 
 // ── 热加载覆盖配置（无需重启 DSH，下次委派即生效）──
 // 优先级：`expert-delegation.config.json`（模块同目录，或 $FLASH_DIRECTOR_CONFIG
@@ -99,6 +101,8 @@ async function resolveSettings() {
     briefMaxChars: Number.isInteger(merged.briefMaxChars) ? merged.briefMaxChars : FALLBACK.briefMaxChars,
     expertReuse: merged.expertReuse === 'off' || merged.expertReuse === 'session' ? merged.expertReuse : FALLBACK.expertReuse,
     reuseMaxFollowups: Number.isInteger(merged.reuseMaxFollowups) && merged.reuseMaxFollowups > 0 ? merged.reuseMaxFollowups : FALLBACK.reuseMaxFollowups,
+    // 思考强度：白名单外的值（含 null/缺省）一律按 undefined 处理 → 不注入。
+    expertReasoningEffort: EFFORT_VALUES.has(merged.expertReasoningEffort) ? merged.expertReasoningEffort : undefined,
   }
 }
 
@@ -111,6 +115,10 @@ const FALLBACK = {
   expertReuse: 'session',
   reuseMaxFollowups: 8,
 }
+
+// 专家子代理思考强度档位（经 agent/request 瀑布注入 child 的请求配置）。
+// 缺省（不在 FALLBACK 中）= undefined = 不注入 = 继承部署/适配器默认。
+const EFFORT_VALUES = new Set(['off', 'low', 'high', 'max'])
 
 // 单字段上限。evidence 是简报里最重的部分（日志、命令输出、文件摘录），
 // 给最大配额；task 是"一个认知问题"，必须保持紧凑。三个字段配额之和刻意
@@ -475,5 +483,30 @@ export default {
 
     ctx.tools.register(consult)
     ctx.tools.register(review)
+
+    // ── 专家子代理思考强度（expertReasoningEffort）──
+    // 平台事实：agent-loop buildRequest 只从会话持久化 header 读 reasoningEffort、
+    // 不读 this.options.reasoningEffort，所以 spawn 时塞进 agentOptions 无效；唯一
+    // 覆盖请求配置的插件扩展点是 agent/request 瀑布。child（continuable 子代理）无
+    // 宿主 installModelSelection，此钩子是 child 侧 effort 的唯一注入源；先 await
+    // next() 再注入，保证任何上游（如未来某处的模型选择）已落定。判定只用本 ctx
+    // 自身 agent（agent-scoped ctx 的 own property；waterfall payload 不带 agent）：
+    // parentSession 存在即专家子代理；主控（顶层会话）无 parentSession、不受影响。
+    // 改动不参与 spawn 指纹 → 切换档位热生效、不轮换 child；非法值由 resolveSettings
+    // 降级为 undefined（不注入）；钩子自身绝不因我们的逻辑破坏专家轮次。
+    ctx.on('agent/request', async (payload, next) => {
+      const resolved = await next() // 下游错误原样上抛，不掩盖
+      try {
+        const agent = ctx.agent
+        const isChild = !!(agent && agent.session && agent.session.header && agent.session.header.parentSession !== undefined)
+        if (!isChild) return resolved
+        const s = await resolveSettings()
+        if (s.expertReasoningEffort === undefined) return resolved
+        const { reasoningEffort: _inherited, ...rest } = resolved
+        return { ...rest, reasoningEffort: s.expertReasoningEffort }
+      } catch {
+        return resolved // 我们自己的任何异常都不改变请求配置
+      }
+    })
   },
 }

@@ -248,11 +248,12 @@ dsh-preset-flash-director info             # 查看安装状态
 | `maxExpertsPerUserTask` | `3` | 每个用户任务的专家委派硬上限（`stakes: high` 审查计 2；复用与新建同价，轮换不额外计费） |
 | `expertReuse` | `session` | 专家子代理复用范围：`session`（同会话内按角色复用同一子代理，后续委派 followup 续聊而非新建，少开 subagent、提高前缀缓存命中；失败自动回落为新建）或 `off`（每次新建，等同旧行为） |
 | `reuseMaxFollowups` | `8` | 单个复用 child 的 followup 轮换上限，达到后强制新建并替换该角色的子代理（防上下文无限膨胀；轮换不额外计预算）。调大 = 更多复用/缓存命中，但单条对话更长，逼近上下文上限时会被 compaction 打断前缀——按实际简报规模调整即可 |
+| `expertReasoningEffort` | `（缺省）` | 专家子代理的思考强度：`off`（关闭思考）/ `low` / `high` / `max`（逐级加大推理强度）。缺省 = 不注入，继承部署/适配器默认，零行为变化。仅作用于专家子代理（主控不受影响）；改热加载文件后该 child 下一请求即生效，不触发轮换。⚠️ 若部署禁用了 thinking，`low/high/max` 可能令专家请求报错——该场景用 `off` 或保持缺省 |
 | `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000（字段配额之和预留头尾余量） |
 
 ### 热加载覆盖配置（不用重启 DSH，旧会话下一轮生效）
 
-上面 7 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
+上面 8 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
 
 用法：
 
@@ -265,9 +266,9 @@ cp flash-director/expert-delegation.config.example.json flash-director/expert-de
 关键行为：
 
 - **换 pro 模型**：改 `expertModel`（或 `expertProvider`/`expertMaxTokens`）后，下一轮委派会把该角色**已复用的旧 child 轮换为新建**、改用新模型（旧 child 不删除，空闲后由宿主回收）。原因：专家子代理的模型在创建时固定并持久化，平台 cold-resume 会原样重放，所以必须新建才能换模型——插件已自动处理，你只改文件即可。
-- **即时生效、不重建**：`reuseMaxFollowups`、`maxExpertsPerUserTask`、`briefMaxChars`、`expertReuse`（开/关复用）改后立即影响后续委派，不动已有 child。
+- **即时生效、不重建**：`reuseMaxFollowups`、`maxExpertsPerUserTask`、`briefMaxChars`、`expertReuse`（开/关复用）、`expertReasoningEffort`（思考强度）改后立即影响后续委派/请求，不动已有 child。
 - **定位**：默认读模块同目录（安装后即 `~/.dsh/.agent-presets/flash-director/expert-delegation.config.json`）；也可用环境变量 `FLASH_DIRECTOR_CONFIG=/path/to/file.json` 指到任意路径。
-- 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。
+- 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。删掉热加载文件 = 回落到基线（基线里也没配的键才回到"继承默认"）。
 
 ## 卸载
 
