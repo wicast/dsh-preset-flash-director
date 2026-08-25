@@ -30,11 +30,15 @@
 // 零依赖（仅 node 内置模块）：服务走 inject，schema 是纯 JSON Schema。默认
 // 模型/预算可被组合行的 config 覆盖（expertProvider/expertModel/expertMaxTokens/
 // maxExpertsPerUserTask/briefMaxChars/expertReuse/reuseMaxFollowups/
-// expertReasoningEffort），并可在运行期用模块同目录的 `expert-delegation.config.json`
-// 热覆盖——无需重启 DSH，旧会话下一次委派即生效；改 expertProvider/expertModel/
-// expertMaxTokens 会让已复用的旧 child 指纹失配而自动轮换为新建（新模型生效）。
+// followupRetryBudget/expertReasoningEffort），并可在运行期用模块同目录的
+// `expert-delegation.config.json` 热覆盖——无需重启 DSH，旧会话下一次委派即
+// 生效；改 expertProvider/expertModel/expertMaxTokens 会让已复用的旧 child
+// 指纹失配而自动轮换为新建（新模型生效）。
 // expertReasoningEffort（off|low|high|max，缺省继承）经 agent/request 瀑布注入
 // 专家子代理的请求配置，改热加载文件后该 child 下一请求即生效、不轮换。
+// 复用健壮性：followup 瞬态失败（NOT_RESUMABLE/DRAINING/ACTIVATION_CLOSING）
+// 保留条目并按 followupRetryBudget 有界重试，permanent（UNAUTHORIZED 等）清槽
+// 禁用；池为空时按 label 经 listChildren 收养仍存活的 child（进程/模块重载后）。
 
 // ── 热加载覆盖配置（无需重启 DSH，下次委派即生效）──
 // 优先级：`expert-delegation.config.json`（模块同目录，或 $FLASH_DIRECTOR_CONFIG
@@ -61,6 +65,23 @@ let lastConfigError = null
 // 避免分隔符碰撞；指纹变化 → 既有复用 child 轮换为新建（config-drift）。
 function fingerprintOf(s) {
   return JSON.stringify([s.expertProvider, s.expertModel, s.expertMaxTokens])
+}
+
+// followup 失败分类（依据 dsh-subagent 管理器的错误语义）：
+//   transient  = 冷恢复竞态/生命周期瞬时边界（NOT_RESUMABLE、DRAINING、
+//                ACTIVATION_CLOSING）→ 保留条目、有界重试，下委派再试
+//   permanent  = 授权失效/能力缺失（UNAUTHORIZED、PERSISTENCE_UNAVAILABLE）及
+//                未知错误（保守）→ 清槽 + 本任务禁用
+//   cancelled  = 调用被 abort → 原样透出，不碰槽与预算
+function classifyFollowupError(error) {
+  const code = error && typeof error.code === 'string'
+    ? error.code
+    : (error && error.name === 'AbortError' ? 'CANCELLED' : 'UNKNOWN')
+  if (code === 'CANCELLED') return { code, cancelled: true, transient: false, permanent: false }
+  if (code === 'NOT_RESUMABLE' || code === 'DRAINING' || code === 'ACTIVATION_CLOSING') {
+    return { code, cancelled: false, transient: true, permanent: false }
+  }
+  return { code, cancelled: false, transient: false, permanent: true }
 }
 
 // 解析一次有效配置：FALLBACK ← cordis ← 覆盖文件，逐键按与 apply 相同的规则校验。
@@ -101,6 +122,7 @@ async function resolveSettings() {
     briefMaxChars: Number.isInteger(merged.briefMaxChars) ? merged.briefMaxChars : FALLBACK.briefMaxChars,
     expertReuse: merged.expertReuse === 'off' || merged.expertReuse === 'session' ? merged.expertReuse : FALLBACK.expertReuse,
     reuseMaxFollowups: Number.isInteger(merged.reuseMaxFollowups) && merged.reuseMaxFollowups > 0 ? merged.reuseMaxFollowups : FALLBACK.reuseMaxFollowups,
+    followupRetryBudget: Number.isInteger(merged.followupRetryBudget) && merged.followupRetryBudget > 0 ? merged.followupRetryBudget : FALLBACK.followupRetryBudget,
     // 思考强度：白名单外的值（含 null/缺省）一律按 undefined 处理 → 不注入。
     expertReasoningEffort: EFFORT_VALUES.has(merged.expertReasoningEffort) ? merged.expertReasoningEffort : undefined,
   }
@@ -114,6 +136,8 @@ const FALLBACK = {
   briefMaxChars: 40000,
   expertReuse: 'session',
   reuseMaxFollowups: 8,
+  // 瞬态 followup 失败（NOT_RESUMABLE 等）的有界重试预算：达到上限才放弃该 child。
+  followupRetryBudget: 2,
 }
 
 // 专家子代理思考强度档位（经 agent/request 瀑布注入 child 的请求配置）。
@@ -312,6 +336,9 @@ export default {
       if (followupDisabled.has(agentKey)) return { action: 'spawn', reason: 'followup-disabled' }
       const entry = poolSlot(agentKey, reviewer)
       if (entry === undefined) return { action: 'spawn', reason: 'no-pool-entry' }
+      // 收养的 child 指纹未知：本委派强制 followup（一次性吸附），成功后以当前
+      // 配置固化指纹，此后受 config-drift 约束（换模型不再被静默复用）。
+      if (entry.adopted === true) return { action: 'followup', entry, reason: 'adopted' }
       // 配置漂移：spawn 指纹键（provider/model/maxTokens）变了 → 旧 child 的
       // 模型已过时，清槽新建（与 followupDisabled 语义无关，只是轮换）。
       if (entry.fingerprint !== fingerprintOf(s)) {
@@ -322,29 +349,61 @@ export default {
       return { action: 'followup', entry, reason: 'reuse' }
     }
 
-    // 把本次简报作为下一次 user turn 投递给既有 child。返回 delegated 结果或
-    // null（followup 失败，调用方应回落为新建）。
-    async function attemptFollowup(entry, brief, parent, exec) {
+    // 把本次简报作为下一次 user turn 投递给既有 child。结构化返回：
+    // 成功 { ok:true, messageId, childId }；失败 { ok:false, code, cls, error }。
+    async function attemptFollowup(entry, brief, parent, exec, retryBudget) {
       try {
         const messageId = await ctx.subagents.followup(parent, entry.childId, [textBlock(brief)], {
           source: { kind: 'coordinator', form: 'relay', senderSessionId: parent.id },
           signal: exec.signal,
         })
         entry.followups += 1
-        return { messageId, reused: true, childId: entry.childId }
+        entry.retries = 0
+        return { ok: true, messageId, childId: entry.childId }
       } catch (error) {
-        return null
+        const cls = classifyFollowupError(error)
+        if (cls.transient) entry.retries = (entry.retries || 0) + 1
+        console.warn(
+          `[flash-director] followup failed (code=${cls.code}, child=${entry.childId}, `
+          + `retries=${entry.retries || 0}/${retryBudget}, ${cls.cancelled ? 'cancelled' : cls.permanent ? 'permanent' : 'transient'})`
+        )
+        return { ok: false, code: cls.code, cls, error }
       }
     }
 
-    // 新建一个专家子代理（fresh spawn），并写入该角色的池 slot（含 spawn 指纹）。
-    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost, s) {
+    // 进程/模块重载后池为空时，按角色 label 在父级子代理列表中找回仍可续的
+    // child（listChildren 持久化感知），避免盲目新建。收养条目 adopted 标记
+    // + 指纹未知；若 listChildren 失败，安静回落为新建，不打断委派。
+    async function adoptExistingChild(agentKey, reviewer, parent, exec) {
+      try {
+        const rows = await ctx.subagents.listChildren(parent.id, exec.signal)
+        const label = reviewer ? 'pro-expert:review' : 'pro-expert:consult'
+        const row = (Array.isArray(rows) ? rows : []).find(
+          (r) => r && r.kind === 'child' && r.mode === 'continuable' && r.label === label && (r.id || r.childId)
+        )
+        if (row === undefined) return
+        setPoolSlot(agentKey, reviewer, {
+          childId: row.id ?? row.childId,
+          followups: 0,
+          fingerprint: null,
+          retries: 0,
+          adopted: true,
+        })
+      } catch (error) {
+        console.warn(`[flash-director] listChildren adoption skipped: ${String(error && error.message ? error.message : error)}`)
+      }
+    }
+
+    // 新建一个专家子代理（fresh spawn）。preserveSlot=true 时（瞬态失败后回落的
+    // 一次性 spawn）不写池槽——被保留的旧 child 留给下一次委派重试，本委派的新
+    // child 是一次性的，空闲后由宿主回收。meta: { reuseReason, followupError? }。
+    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost, s, meta, preserveSlot) {
       ledger.used += cost
       try {
         const started = await ctx.subagents.startContinuable({
           provider: 'spawn',
           // 角色化 label：复用的 child 会跨 kind 服务，label 保持稳定便于
-          // list_agents 识别（consult / review 两池）。
+          // list_agents 识别与 listChildren 收养（consult / review 两池）。
           label: reviewer ? 'pro-expert:review' : 'pro-expert:consult',
           request: {
             prompt: [textBlock(brief)],
@@ -359,19 +418,24 @@ export default {
           },
           signal: exec.signal,
         })
-        setPoolSlot(agentKeyOf(parent), reviewer, {
-          childId: started.childId,
-          followups: 0,
-          fingerprint: fingerprintOf(s),
-        })
-        return delegatedResult(started.childId, started.messageId, reviewer, ledger, s, { reused: false, cost })
+        if (preserveSlot !== true) {
+          setPoolSlot(agentKeyOf(parent), reviewer, {
+            childId: started.childId,
+            followups: 0,
+            fingerprint: fingerprintOf(s),
+            retries: 0,
+            adopted: false,
+          })
+        }
+        return delegatedResult(started.childId, started.messageId, reviewer, ledger, s, { reused: false, cost, ...meta })
       } catch (error) {
         ledger.used -= cost
         return { status: 'failed', error: String(error && error.message ? error.message : error) }
       }
     }
 
-    // 统一委派入口：解析有效配置 → 预算闸门 → 会话内复用决策 → followup 优先、失败回落新建。
+    // 统一委派入口：解析有效配置 → 预算闸门 → （可选）收养找回 → 复用决策
+    // → followup 优先、失败按分类回落新建。
     // s 由调用方（工具 execute）解析一次并下传，保证一次委派内键一致。
     async function spawnExpert(args, reviewer, exec, s) {
       const parent = exec.agent
@@ -392,20 +456,48 @@ export default {
         }
       }
 
+      // 池空且复用开启：尝试按 label 收养仍存活的 child（进程/模块重载后）。
+      if (s.expertReuse === 'session' && !followupDisabled.has(agentKey) && poolSlot(agentKey, reviewer) === undefined) {
+        await adoptExistingChild(agentKey, reviewer, parent, exec)
+      }
+
       const decision = decideReuse(reviewer, agentKey, s)
       if (decision.action === 'followup') {
         ledger.used += cost
-        const outcome = await attemptFollowup(decision.entry, brief, parent, exec)
-        if (outcome !== null) {
-          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, s, { reused: true, cost })
+        const outcome = await attemptFollowup(decision.entry, brief, parent, exec, s.followupRetryBudget)
+        if (outcome.ok) {
+          // 收养条目一次性吸附后固化：指纹以当前配置为准，后续受 config-drift 约束。
+          if (decision.entry.adopted === true) {
+            decision.entry.adopted = false
+            decision.entry.fingerprint = fingerprintOf(s)
+          }
+          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, s, {
+            reused: true,
+            cost,
+            reuseReason: decision.reason,
+          })
         }
-        // followup 失败：退款、禁用本任务复用、清掉坏 slot，回落为新建。
+        // followup 失败：退款；CANCELLED 原样透出；transient 保留条目有界重试，
+        // permanent 清槽 + 本任务禁用；预算不重复扣（spawn 路径重新记账）。
         ledger.used -= cost
-        followupDisabled.add(agentKey)
-        clearPoolSlot(agentKey, reviewer)
+        if (outcome.cls.cancelled) throw outcome.error
+        const willRetry = outcome.cls.transient && (decision.entry.retries || 0) < s.followupRetryBudget
+        const reuseMeta = {
+          reuseReason: `followup-error:${outcome.code}`,
+          followupError: { code: outcome.code, retries: decision.entry.retries || 0, willRetry },
+        }
+        if (outcome.cls.permanent) {
+          followupDisabled.add(agentKey)
+          clearPoolSlot(agentKey, reviewer)
+        } else if (!willRetry) {
+          // 瞬态重试预算耗尽：清槽但不禁用（不是授权失效，只是该 child 老化）。
+          clearPoolSlot(agentKey, reviewer)
+        }
+        // willRetry=true 时保留被重试的旧 entry，本次回落 spawn 不覆盖槽位。
+        return spawnFresh(reviewer, brief, parent, exec, ledger, cost, s, reuseMeta, willRetry)
       }
 
-      return spawnFresh(reviewer, brief, parent, exec, ledger, cost, s)
+      return spawnFresh(reviewer, brief, parent, exec, ledger, cost, s, { reuseReason: decision.reason })
     }
 
     const consult = {

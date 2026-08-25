@@ -6,5 +6,6 @@
   "briefMaxChars": 40000,
   "expertReuse": "session",
   "reuseMaxFollowups": 8,
+  "followupRetryBudget": 2,
   "expertReasoningEffort": "high"
 }

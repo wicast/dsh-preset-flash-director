@@ -70,7 +70,7 @@
 
 1. **简报校验**：`task`/`background`/`evidence`/`acceptance` 必填且有界（简报整体 ≤40000，task ≤4000、background ≤14000、evidence ≤18000），超大即拒绝。三字段配额之和刻意留出头尾余量，各字段到顶时拼装后仍不超整体上限。
 2. **预算账本**：按 agent 记账，`agent/pre-step` 检测到新人类消息（`source.kind === 'user'`）时清零；每个认知委派计 1 次（`stakes: high` 计 2），复用与新建同价、轮换不额外计费；先记账后尝试、失败退款。
-3. **会话内复用（默认开启）**：同一会话内按角色（咨询/审查）各复用同一子代理——连续委派经 `followup` 续聊而非重复新建，整段对话成为前缀缓存共享前缀；`reuseMaxFollowups` 轮换上限防上下文无限膨胀；followup 失败（父实例失效/不可恢复等）自动回落为新建，并禁用本任务的复用（下条人类消息重试）。
+3. **会话内复用（默认开启）**：同一会话内按角色（咨询/审查）各复用同一子代理——连续委派经 `followup` 续聊而非重复新建，整段对话成为前缀缓存共享前缀；`reuseMaxFollowups` 轮换上限防上下文无限膨胀。**健壮性**：followup 瞬态失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING`，多为冷恢复与落盘竞态）保留条目并按 `followupRetryBudget` 有界重试、下次委派再试；permanent（`UNAUTHORIZED`/`PERSISTENCE_UNAVAILABLE`/未知错误）才清槽禁用；池为空（如 DSH 进程/插件重载后）会经 `listChildren` 按 label **收养仍存活的 child** 继续复用，而不是盲目新建。每次委派结果带 `reuseReason` 与（失败时）`followupError` 诊断字段。
 4. **禁止专家链**：专家子代理被摘除一切委派/写入工具，只能通过 `bash`/`read` 等低成本手段验证假设，不能修改工作区。
 5. **验收循环**：主控在委派**之前**写好 `acceptance` 清单，专家回报后逐项机械验证（跑测试/命令/查格式），这是"弱指挥强"的支点。
 
@@ -248,12 +248,13 @@ dsh-preset-flash-director info             # 查看安装状态
 | `maxExpertsPerUserTask` | `3` | 每个用户任务的专家委派硬上限（`stakes: high` 审查计 2；复用与新建同价，轮换不额外计费） |
 | `expertReuse` | `session` | 专家子代理复用范围：`session`（同会话内按角色复用同一子代理，后续委派 followup 续聊而非新建，少开 subagent、提高前缀缓存命中；失败自动回落为新建）或 `off`（每次新建，等同旧行为） |
 | `reuseMaxFollowups` | `8` | 单个复用 child 的 followup 轮换上限，达到后强制新建并替换该角色的子代理（防上下文无限膨胀；轮换不额外计预算）。调大 = 更多复用/缓存命中，但单条对话更长，逼近上下文上限时会被 compaction 打断前缀——按实际简报规模调整即可 |
+| `followupRetryBudget` | `2` | 瞬态 followup 失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING`）的有界重试预算：连续失败达到上限才放弃该 child 换新建；成功即清零 |
 | `expertReasoningEffort` | `（缺省）` | 专家子代理的思考强度：`off`（关闭思考）/ `low` / `high` / `max`（逐级加大推理强度）。缺省 = 不注入，继承部署/适配器默认，零行为变化。仅作用于专家子代理（主控不受影响）；改热加载文件后该 child 下一请求即生效，不触发轮换。⚠️ 若部署禁用了 thinking，`low/high/max` 可能令专家请求报错——该场景用 `off` 或保持缺省 |
 | `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000（字段配额之和预留头尾余量） |
 
 ### 热加载覆盖配置（不用重启 DSH，旧会话下一轮生效）
 
-上面 8 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
+上面 9 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
 
 用法：
 
@@ -283,7 +284,7 @@ rm -rf ~/.dsh/.agent-presets/flash-director    # 或 dsh-preset-flash-director u
 | 委派返回 `rejected` | 简报缺字段或超限：按返回信息补全/精炼 `evidence`、`background`、`acceptance` 后重试（上限见配置表） |
 | 委派返回 `budget-exhausted` | 本用户任务预算耗尽：主控自行收尾并告知用户；新消息后自动重置；或调大 `maxExpertsPerUserTask` |
 | 专家迟迟不回报 | `list_agents` 查看状态；跑飞可用 `interrupt_agent` 止损；确认模型 id 正确（无效模型会让子代理报错） |
-| 同一会话内 `reused` 一直为 `false`（没在复用） | 可能原因：轮换达到 `reuseMaxFollowups`、consult/review 角色交替（各用各的 child）、或本任务内 followup 已失败（父实例失效）被临时禁用。插件会自动回落为新建，功能不受影响；下一条人类消息会重试复用 |
+| 同一会话内 `reused` 一直为 `false`（没在复用） | 先看委派结果的 `reuseReason`：`reuse` = 复用成功；`no-pool-entry` = 池空（多为 DSH 进程/插件重载后，插件会尝试按 label 收养活着的 child）；`followup-error:<CODE>` = followup 失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING` 为瞬态，插件保留条目下次重试；`UNAUTHORIZED`/`PERSISTENCE_UNAVAILABLE`/未知为永久，清槽禁用）；`config-drift` = 模型等 spawn 指纹键已变（正常轮换）；`rotation-cap` = 达到 `reuseMaxFollowups`；`followup-disabled` = 本任务内已永久失败，下条人类消息重试。`followupError` 字段给出精确错误码与重试状态 |
 | 想彻底关闭复用 | 把 `agent.cordis.yml` 里 `expert-delegation` 行的 `expertReuse` 改为 `off`（等同旧行为：每次新建子代理）；运行期可用热加载文件的 `expertReuse: "off"` 立即关闭 |
 | 改了 `expertModel` 但委派结果里 `reused` 还是 `true` | 检查覆盖文件是否被读到（路径：模块同目录 `expert-delegation.config.json` 或 `$FLASH_DIRECTOR_CONFIG`；保存后**下一次委派**才生效）；该角色旧 child 会在指纹失配时自动轮换新建——若 `reused=true` 说明指纹没变，确认改动的是 `expertModel`/`expertProvider`/`expertMaxTokens` 三键之一 |
 | 覆盖文件写坏了 | JSON 畸形/非对象 → 安全回落到最后可用配置，委派照常（不会抛错打断工具）；修好文件（mtime 变化）后下次委派自动恢复 |
