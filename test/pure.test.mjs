@@ -106,6 +106,32 @@ test('patchCordisBaseline 插入缺失键', () => {
   assert.match(r.text, /\n {8}expertReuse: "off"/)
 })
 
+test('CRLF 文件（\\r\\n）可读基线且 patch 不产生重复键', () => {
+  // Windows core.autocrlf=true 检出或工具生成的文件是 CRLF；
+  // 行级键正则对行尾 \\r 敏感，必须容错（回归：duplicated mapping key (222:9)）
+  const crlfText = text.replace(/\r?\n/g, '\r\n')
+  assert.ok(crlfText.includes('\r\n'), '前置：文本应为 CRLF')
+
+  const r = readBaselineConfig(crlfText)
+  assert.equal(r.ok, true)
+  assert.equal(Object.keys(r.values).length, 7)
+  assert.equal(r.values.expertModel, 'deepseek-v4-pro')
+
+  const p = patchCordisBaseline(crlfText, { expertModel: 'mimo-v2.5-free' })
+  assert.equal(p.ok, true)
+  // 不产生重复键：expertModel 只出现一次
+  const hits = p.text.split('\n').filter((l) => l.trim().startsWith('expertModel:')).length
+  assert.equal(hits, 1)
+  // EOL 风格保持 CRLF（逐字保留承诺）
+  assert.ok(p.text.includes('\r\n'))
+  // 全文仍能被宽容 YAML 解析且 config 完整
+  const doc = yaml.load(p.text, { schema: PERMISSIVE })
+  const row = findById(doc, 'expert-delegation')
+  assert.ok(row && row.config && typeof row.config === 'object')
+  assert.equal(row.config.expertModel, 'mimo-v2.5-free')
+  assert.equal(row.config.expertProvider, 'deepseek-official')
+})
+
 test('patch 后全文仍能被宽容 YAML 解析且 expert-delegation 行 config 完整', () => {
   const r = patchCordisBaseline(text, { expertModel: 'deepseek-v4-pro-fixed', expertMaxTokens: 65536 })
   assert.equal(r.ok, true)
