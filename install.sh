@@ -22,7 +22,7 @@ fi
 cp -R "$PRESET_SOURCE" "$TARGET"
 echo "installed preset -> $TARGET"
 echo ""
-echo "--- 部署配置 UI（dsh-flash-director-ui）---"
+echo "--- 部署配置 UI（dsh-preset-flash-director）---"
 if [[ -f "$SCRIPT_DIR/bin/dsh-preset-flash-director.mjs" ]]; then
   if node "$SCRIPT_DIR/bin/dsh-preset-flash-director.mjs" install-ui; then
     echo ""

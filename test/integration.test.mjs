@@ -1,5 +1,5 @@
 /**
- * dsh-flash-director-ui — 服务端半集成测试（mock webServer + settings，真实文件）
+ * dsh-preset-flash-director — 服务端半集成测试（mock webServer + settings，真实文件）
  * 运行：node --test ui/test/integration.test.mjs
  *
  * 用临时 preset 目录（含真实 agent.cordis.yml 副本）验证：

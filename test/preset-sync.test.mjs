@@ -1,5 +1,5 @@
 /**
- * dsh-flash-director-ui — 预设自动同步单测
+ * dsh-preset-flash-director — 预设自动同步单测
  * 运行：node --test ui/test/preset-sync.test.mjs
  *
  * 覆盖：install / adopt（不覆盖手动内容）/ noop（版本+哈希一致）/ 不降级 /

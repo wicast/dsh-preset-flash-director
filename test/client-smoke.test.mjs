@@ -1,5 +1,5 @@
 /**
- * dsh-flash-director-ui — 客户端渲染冒烟测试
+ * dsh-preset-flash-director — 客户端渲染冒烟测试
  * 运行：node --test ui/test/client-smoke.test.mjs
  *
  * 用最小 react shim 在 Node 里执行客户端 bundle 的 SettingsPanel 渲染，
@@ -46,6 +46,9 @@ function loadClient() {
   registered = null
   new Function('window', code)(fakeWindow)
   assert.ok(registered, 'bundle 应注册到 __ModuleLoader__')
+  // 回归防线：客户端 bundle 的注册 id 必须等于包名（改名后曾漏改导致
+  // "loaded without registering <pkg> via __ModuleLoader__.load" 加载失败）
+  assert.equal(registered.id, 'dsh-preset-flash-director')
   return registered.factory(fakeRequire)
 }
 

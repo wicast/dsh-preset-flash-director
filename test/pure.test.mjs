@@ -1,5 +1,5 @@
 /**
- * dsh-flash-director-ui — 纯函数层单测（node:test）
+ * dsh-preset-flash-director — 纯函数层单测（node:test）
  * 运行：node --test ui/test/pure.test.mjs
  *
  * js-yaml 仅用于"写后宽容 YAML 校验"的验证测试；解析器优先用 node 可解析的
