@@ -271,6 +271,25 @@ cp flash-director/expert-delegation.config.example.json flash-director/expert-de
 - **定位**：默认读模块同目录（安装后即 `~/.dsh/.agent-presets/flash-director/expert-delegation.config.json`）；也可用环境变量 `FLASH_DIRECTOR_CONFIG=/path/to/file.json` 指到任意路径。
 - 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。删掉热加载文件 = 回落到基线（基线里也没配的键才回到"继承默认"）。
 
+### 配置界面：`dsh-flash-director-ui`（复用 DSH 设置页）
+
+仓库 `ui/` 是一个独立的 DSH 插件（`dsh-flash-director-ui`），给上面的配置提供图形界面，**复用 DSH 的设置界面**：
+
+- 设置侧栏新增 **「Flash 主控」** 分区页：编辑覆盖文件（9 键，保存后下次委派生效）与基线 `agent.cordis.yml`（7 键，行级 patch，新开会话生效），并显示每个键当前的生效值与来源（override/基线/默认）。
+- 官方**插件配置**页出现 **Flash 主控 · Pro 专家** 卡片（schemastery 表单，提交后单向镜像到覆盖文件）。
+- 端点：`/api/flash-director/{state,override,baseline}`（同源校验、原子写、基线写前备份 + 写后 YAML 校验回滚）。
+
+安装（把仓库 `ui/` link 进运行中的 web profile）：
+
+```bash
+# ~/.dsh/profiles/web/package.json
+#   dependencies: 加 "dsh-flash-director-ui": "link:/path/to/dsh-preset-flash-director/ui"
+#   dsh.profile.bundles: 加 "dsh-flash-director-ui"
+cd ~/.dsh/profiles/web && pnpm install   # 然后重启 DSH Desktop，刷新页面
+```
+
+详见 [`ui/README.md`](ui/README.md)。单测：`node --test "ui/test/*.test.mjs"`。
+
 ## 卸载
 
 ```bash

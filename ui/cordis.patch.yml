@@ -1,0 +1,7 @@
+# dsh-flash-director-ui：Flash 主控 · Pro 专家 预设的配置界面
+# 安装方式：软链到 ~/.dsh/profiles/web/node_modules/dsh-flash-director-ui + profile package.json
+#           bundles 列表加 dsh-flash-director-ui（或发布后 dsh plugin --profile web add）
+# 生效方式：重启 dsh web（bash ~/.dsh/restart-dsh-web.sh）
+- insert:
+    - id: flash-director-ui
+      name: 'dsh-flash-director-ui'

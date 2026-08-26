@@ -19,6 +19,7 @@
   "files": [
     "bin",
     "flash-director",
+    "ui",
     "README.md",
     "LICENSE"
   ],
