@@ -1,7 +1,7 @@
 {
   "name": "dsh-preset-flash-director",
-  "version": "0.1.2",
-  "description": "Flash 主控 · Pro 专家 — a DeepSeek Harness agent preset: flash-model orchestrator + pro-model (deepseek-v4-pro) expert subagents, with an enforced delegation protocol (curated briefs, hard per-task budget, no delegation chains).",
+  "version": "0.2.0",
+  "description": "Flash 主控 · Pro 专家 —— 一个 DSH 插件 = 配置界面（复用 DSH 设置页）+ 自动部署 agent 预设：插件加载时把打包的预设同步到 $DSH_HOME/.agent-presets/flash-director（保留用户配置），并提供设置页编辑覆盖文件与基线。",
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -13,16 +13,41 @@
     "token-economy"
   ],
   "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "dsh-preset-flash-director": "bin/dsh-preset-flash-director.mjs"
   },
   "files": [
-    "bin",
+    "lib",
     "flash-director",
-    "ui",
+    "cordis.patch.yml",
+    "bin",
     "README.md",
     "LICENSE"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.7 || ^0.1.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "js-yaml": "^4.0.0"
+  },
   "engines": {
     "node": ">=18"
   },

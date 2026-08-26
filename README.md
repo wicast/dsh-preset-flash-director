@@ -88,31 +88,36 @@
 
 ## 安装
 
-### 方式一：git 克隆后拷贝（最直接）
+> **整个项目就是一个 DSH 插件**：包内自带 agent 预设（`flash-director/`）与配置界面（`lib/`）。装好插件、重启 DSH，插件加载时**自动把预设部署到 `~/.dsh/.agent-presets/flash-director`**（带版本门 + 内容哈希：缺失安装 / 版本升级或内容变化时拷贝，**保留你的 `expert-delegation.config.json`**，检测到你改过基线就不覆盖，绝不静默覆盖用户配置）。需要 Node ≥ 18。
+
+### 方式一（推荐）：`dsh plugin` 一键安装
 
 ```bash
 git clone https://github.com/zhaoyilun/dsh-preset-flash-director.git
-mkdir -p ~/.dsh/.agent-presets
-cp -R dsh-preset-flash-director/flash-director ~/.dsh/.agent-presets/
+# 整个项目路径即插件包（本地未发布也可用；发布到 npm 后可用包名）
+dsh plugin --profile web add /path/to/dsh-preset-flash-director
+# 等价于 pnpm add + 自动 reconcile bundles（包声明了 dsh.bundle.patch 即自动加入）
+# 然后：重启 DSH Desktop —— 插件加载时自动部署预设；刷新页面出现「Flash 主控」设置页
 ```
 
-### 方式二：仓库内的安装脚本
+### 方式二：仓库内安装脚本（无需 dsh CLI）
 
 ```bash
 git clone https://github.com/zhaoyilun/dsh-preset-flash-director.git
 cd dsh-preset-flash-director
-./install.sh        # 已存在则自动备份
+./install.sh        # 拷贝预设（兼容旧流程）+ 自动部署插件（触发自动同步）
 ```
 
 ### 方式三：npm 包装包
 
 ```bash
 npm install -g dsh-preset-flash-director   # 或 npx dsh-preset-flash-director install
-dsh-preset-flash-director install
+dsh-preset-flash-director install          # 拷贝预设 + 部署插件（一步到位）
+dsh-preset-flash-director install-ui       # 仅部署/修复插件（预设由插件自动同步）
 dsh-preset-flash-director info             # 查看安装状态
 ```
 
-> 安装即拷贝目录，**无需重启**：DSH 名册每次调用都会重扫预设根目录。卸载用 `dsh-preset-flash-director uninstall`（保留备份）。
+> 预设经插件自动同步，**无需手动重启**：DSH 名册每次调用都会重扫预设根目录；**插件需要重启 DSH Desktop** 才加载（web profile 启动时读 bundles，加载时执行预设同步）。为什么预设不直接放 `~/.dsh/.agent-presets/` 由安装器拷贝：`.agent-presets` 扫描器把每个子目录都当预设槽位，插件目录（无 `agent.cordis.yml` 根文件）会显示成"损坏预设"。所以插件统一装到 `~/.dsh/plugins/dsh-preset-flash-director`（或以 `link:` 接入 bundles），由插件自己负责把预设同步到位。卸载预设用 `dsh-preset-flash-director uninstall`（保留备份）；卸载插件用 `uninstall-ui` 或 `dsh plugin --profile web remove dsh-preset-flash-director`。
 
 ## 使用指南
 
@@ -271,29 +276,37 @@ cp flash-director/expert-delegation.config.example.json flash-director/expert-de
 - **定位**：默认读模块同目录（安装后即 `~/.dsh/.agent-presets/flash-director/expert-delegation.config.json`）；也可用环境变量 `FLASH_DIRECTOR_CONFIG=/path/to/file.json` 指到任意路径。
 - 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。删掉热加载文件 = 回落到基线（基线里也没配的键才回到"继承默认"）。
 
-### 配置界面：`dsh-flash-director-ui`（复用 DSH 设置页）
+### 配置界面 + 自动部署：一个插件 = 全部
 
-仓库 `ui/` 是一个独立的 DSH 插件（`dsh-flash-director-ui`），给上面的配置提供图形界面，**复用 DSH 的设置界面**：
+**整个仓库即一个 DSH 插件（`dsh-preset-flash-director`）**，包内自带 agent 预设（`flash-director/`），加载时自动把预设同步到 `~/.dsh/.agent-presets/flash-director`（版本门 + 内容哈希：缺失安装 / 版本升级或内容变化时更新拷贝，保留你的 `expert-delegation.config.json`，检测到你改过基线就不覆盖、新版基线旁侧存放 + 警告，不降级、不覆盖无标记的手动安装），并**复用 DSH 的设置界面**给配置提供图形界面：
 
-- 设置侧栏新增 **「Flash 主控」** 分区页：编辑覆盖文件（9 键，保存后下次委派生效）与基线 `agent.cordis.yml`（7 键，行级 patch，新开会话生效），并显示每个键当前的生效值与来源（override/基线/默认）。
+- 设置侧栏新增 **「Flash 主控」** 分区页：编辑覆盖文件（9 键，保存后下次委派生效）与基线 `agent.cordis.yml`（7 键，行级 patch，新开会话生效），并显示每个键当前的生效值与来源（override/基线/默认）；Provider/模型下拉取自 DSH 现有设置（与模型选择器同源）。
 - 官方**插件配置**页出现 **Flash 主控 · Pro 专家** 卡片（schemastery 表单，提交后单向镜像到覆盖文件）。
 - 端点：`/api/flash-director/{state,override,baseline}`（同源校验、原子写、基线写前备份 + 写后 YAML 校验回滚）。
 
-安装（把仓库 `ui/` link 进运行中的 web profile）：
+安装（装插件即全自动）：
 
 ```bash
-# ~/.dsh/profiles/web/package.json
-#   dependencies: 加 "dsh-flash-director-ui": "link:/path/to/dsh-preset-flash-director/ui"
-#   dsh.profile.bundles: 加 "dsh-flash-director-ui"
-cd ~/.dsh/profiles/web && pnpm install   # 然后重启 DSH Desktop，刷新页面
+dsh plugin --profile web add /path/to/dsh-preset-flash-director   # 一键
+# 或（无 dsh CLI 时）：node bin/dsh-preset-flash-director.mjs install-ui
+# 等价于：拷贝插件包 -> ~/.dsh/plugins/dsh-preset-flash-director
+#          ~/.dsh/profiles/web/package.json 加 link: 依赖 + bundles 条目（幂等）
+#          在 web profile 执行 pnpm install
+# 重启 DSH Desktop：插件加载时自动部署预设 + 刷新页面出现设置页
 ```
 
-详见 [`ui/README.md`](ui/README.md)。单测：`node --test "ui/test/*.test.mjs"`。
+> 插件定位活动预设不依赖自身位置（`lib/paths.mjs` 用 `$FLASH_DIRECTOR_PRESET_DIR` / `$DSH_HOME/.agent-presets/flash-director` / 仓库回退），所以无需放在预设目录里。文件结构：`lib/`（服务端+客户端+纯函数）、`flash-director/`（打包预设）、`cordis.patch.yml`（bundle insert）、`bin/`（零依赖安装器）。
+
+单测：`node --test "test/*.test.mjs"`。
 
 ## 卸载
 
 ```bash
-rm -rf ~/.dsh/.agent-presets/flash-director    # 或 dsh-preset-flash-director uninstall
+# 插件（移除 web profile 接线 + 备份插件目录）
+dsh-preset-flash-director uninstall-ui        # 或 node bin/dsh-preset-flash-director.mjs uninstall-ui
+# 或 dsh plugin --profile web remove dsh-preset-flash-director
+# 预设（保留 .bak-<ts> 备份）
+dsh-preset-flash-director uninstall           # 或 rm -rf ~/.dsh/.agent-presets/flash-director
 ```
 
 ## 排障

@@ -57,7 +57,7 @@ function findById(node, id) {
   return null
 }
 
-const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'flash-director')
+const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'flash-director')
 const YML = join(REPO_DIR, 'agent.cordis.yml')
 const text = readFileSync(YML, 'utf8')
 

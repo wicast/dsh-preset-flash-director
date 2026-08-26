@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 
 import { apply } from '../lib/index.js'
 
-const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'flash-director')
+const REPO_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'flash-director')
 
 function makeReq(method, body, extraHeaders) {
   const buf = body === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body))

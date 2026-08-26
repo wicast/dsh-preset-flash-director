@@ -1,0 +1,6 @@
+# dsh-preset-flash-director：Flash 主控 · Pro 专家（一个插件 = 配置界面 + 自动部署预设）
+# 安装：dsh plugin --profile web add <本仓库路径>（或发布后 dsh plugin --profile web add dsh-preset-flash-director）
+# 生效：重启 DSH Desktop（web profile 启动时读 bundles；插件加载时自动同步 agent 预设）
+- insert:
+    - id: dsh-preset-flash-director
+      name: 'dsh-preset-flash-director'
