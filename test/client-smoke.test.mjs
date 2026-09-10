@@ -60,10 +60,22 @@ function makeState(providers) {
     presetDir: '/Users/x/.dsh/.agent-presets/flash-director',
     overridePath: '/Users/x/.dsh/.agent-presets/flash-director/expert-delegation.config.json',
     baselinePath: '/Users/x/.dsh/.agent-presets/flash-director/agent.cordis.yml',
-    override: { path: '', exists: true, values: { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro' }, configError: null },
+    override: {
+      path: '', exists: true, configError: null,
+      values: { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro', expertFallbackProvider: 'scnet', expertFallbackModel: 'DeepSeek-V4-Flash-0731' },
+    },
     baseline: { path: '', exists: true, values: { expertProvider: 'deepseek-official', expertModel: 'deepseek-v4-pro' }, configError: null },
-    effective: { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro', expertMaxTokens: 32768, maxExpertsPerUserTask: 3, briefMaxChars: 40000, expertReuse: 'session', reuseMaxFollowups: 8, followupRetryBudget: 2, expertReasoningEffort: 'max' },
-    source: { expertProvider: 'override', expertModel: 'override', expertMaxTokens: 'default', maxExpertsPerUserTask: 'default', briefMaxChars: 'default', expertReuse: 'default', reuseMaxFollowups: 'default', followupRetryBudget: 'default', expertReasoningEffort: 'override' },
+    effective: {
+      expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro', expertMaxTokens: 32768, maxExpertsPerUserTask: 3,
+      briefMaxChars: 40000, expertReuse: 'session', reuseMaxFollowups: 8, followupRetryBudget: 2, expertReasoningEffort: 'max',
+      expertFallbackProvider: 'scnet', expertFallbackModel: 'DeepSeek-V4-Flash-0731',
+    },
+    source: {
+      expertProvider: 'override', expertModel: 'override', expertMaxTokens: 'default', maxExpertsPerUserTask: 'default',
+      briefMaxChars: 'default', expertReuse: 'default', reuseMaxFollowups: 'default', followupRetryBudget: 'default',
+      expertReasoningEffort: 'override', expertFallbackProvider: 'override', expertFallbackModel: 'override',
+      expertFallbackMaxTokens: 'default', expertFallbackReasoningEffort: 'default',
+    },
     providers: providers || [],
     providersAvailable: !!providers,
   }
@@ -115,6 +127,27 @@ function flatten(n, out = []) {
   return out
 }
 
+/**
+ * 按字段标签取控件（不依赖渲染顺序/下标——加字段不再让断言错位）。
+ * 每张卡片里同一个 label 只出现一次；override 卡在前、基线卡在后。
+ * @returns {Array<object>} 匹配该标签的控件（select/input），按出现顺序
+ */
+function controlsByLabel(nodes, labelText) {
+  const rows = nodes.filter((n) => n.props && n.props.className === 'fd-row')
+  const found = []
+  for (const row of rows) {
+    const flat = flatten(row)
+    const label = flat.find((n) => n.props && n.props.className === 'fd-label')
+    const text = label && label.children && label.children[0]
+    if (typeof text !== 'string' || !text.includes(labelText)) continue
+    const control = flat.find((n) => n.props && (n.props.className === 'fd-select' || n.props.className === 'fd-input'))
+    if (control) found.push(control)
+  }
+  return found
+}
+
+const optionValues = (control) => flatten(control).filter((o) => o.type === 'option').map((o) => o.props.value)
+
 test('SettingsPanel 渲染（有 providers）：不抛错且产出控件树', () => {
   const providers = [
     { id: 'opencode-go', name: 'OpenCode Go', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }, { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' }] },
@@ -123,22 +156,38 @@ test('SettingsPanel 渲染（有 providers）：不抛错且产出控件树', ()
   const tree = renderPanel(makeState(providers))
   const nodes = flatten(tree)
   const sels = nodes.filter((n) => n.props && n.props.className === 'fd-select')
-  // 至少包含 expertProvider 与 expertModel 两个下拉（override + baseline 各一对）
-  assert.ok(sels.length >= 4, `应渲染 ≥4 个下拉（实际 ${sels.length}）`)
-  // expertProvider 下拉（override 表单 sels[0]）应含当前值 opencode-go；基线表单（sels[4]）应保留不在列表的 deepseek-official
-  const overrideProviderSel = sels[0]
-  const opts = flatten(overrideProviderSel).filter((o) => o.type === 'option').map((o) => o.props.value)
-  assert.ok(opts.includes('opencode-go'))
-  assert.ok(opts.includes('scnet'))
-  const baselineProviderSel = sels[4]
-  const bopts = flatten(baselineProviderSel).filter((o) => o.type === 'option').map((o) => o.props.value)
-  assert.ok(bopts.includes('deepseek-official')) // 基线当前值不在列表 → 追加保留
-  // expertModel 下拉（override 表单 sels[1]，跟随 opencode-go）应只含其模型
-  const modelSel = sels[1]
-  const mopts = flatten(modelSel).filter((o) => o.type === 'option').map((o) => o.props.value)
+  // 覆盖表单（provider/model/expertReuse/effort + fallback 3 个下拉）+ 基线表单（provider/model/expertReuse）
+  assert.ok(sels.length >= 10, `应渲染 ≥10 个下拉（实际 ${sels.length}）`)
+
+  // 覆盖表单：provider 下拉含目录里的两个 provider；模型下拉跟随 provider
+  const ovProvider = controlsByLabel(nodes, '专家 Provider')[0]
+  const ovOpts = optionValues(ovProvider)
+  assert.ok(ovOpts.includes('opencode-go'))
+  assert.ok(ovOpts.includes('scnet'))
+  const ovModel = controlsByLabel(nodes, '专家模型')[0]
+  const mopts = optionValues(ovModel)
   assert.ok(mopts.includes('deepseek-v4-pro'))
   assert.ok(mopts.includes('deepseek-v4-flash'))
   assert.ok(!mopts.includes('DeepSeek-V4-Flash-0731'))
+
+  // 基线表单：当前值不在目录里 → 追加保留
+  const bsProvider = controlsByLabel(nodes, '专家 Provider')[1]
+  assert.ok(bsProvider, '基线表单应有 Provider 下拉')
+  assert.ok(optionValues(bsProvider).includes('deepseek-official'))
+
+  // fallback：provider 下拉同源目录；模型下拉跟随 fallback provider（state 里为 scnet）
+  const fbProvider = controlsByLabel(nodes, 'Fallback Provider')[0]
+  assert.ok(fbProvider, '覆盖表单应有 Fallback Provider 下拉')
+  assert.ok(optionValues(fbProvider).includes('local-gateway') === false) // 目录里没有就不该凭空出现
+  assert.ok(optionValues(fbProvider).includes('scnet'))
+  const fbModel = controlsByLabel(nodes, 'Fallback 模型')[0]
+  const fbOpts = optionValues(fbModel)
+  assert.ok(fbOpts.includes('DeepSeek-V4-Flash-0731')) // 跟随 scnet
+  assert.ok(!fbOpts.includes('deepseek-v4-pro')) // 不是 opencode-go 的模型
+  // 空值选项 = 关闭 fallback（可发现"怎么关"）
+  const fbEmpty = flatten(fbModel).find((o) => o.type === 'option' && o.props.value === '')
+  assert.ok(fbEmpty, 'Fallback 模型下拉应有空值选项')
+  assert.match(String(fbEmpty.children[0]), /关闭 fallback/)
 })
 
 test('SettingsPanel 渲染（无 providers）：回退文本输入，不抛错', () => {

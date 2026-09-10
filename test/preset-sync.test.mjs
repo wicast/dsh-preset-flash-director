@@ -123,8 +123,24 @@ test('B2：用户改过基线 → 更新保留用户基线 + 新版旁侧 + 警�
   // 新版基线旁侧存在
   const side = readdirSync(target()).find((s) => s.startsWith('agent.cordis.yml.bundled-'))
   assert.ok(side, '应有旁侧新版基线文件')
-  // 新标记的 b = 用户基线的哈希（下次以此为准）
-  assert.equal(markerOf().b, sha256(userBaseline))
+  // 新标记的 b 继续记"打包基线"的指纹（= 旁侧文件内容），而不是用户基线的哈希：
+  // 记用户基线的哈希会让下一次更新误判成"用户没改过" → 静默覆盖（保护只生效一次）
+  assert.equal(markerOf().b, sha256(readFileSync(join(target(), side), 'utf8')))
+  assert.notEqual(markerOf().b, sha256(userBaseline))
+})
+
+test('B2 反复生效：连续多次更新都不会覆盖用户基线', async () => {
+  // 前置：上一用例已让用户基线被保留 + 旁侧新版存在
+  const userBaseline = readFileSync(join(target(), BASELINE), 'utf8')
+  assert.match(userBaseline, /# user edit/)
+
+  // 再跑两轮更新（版本继续 bump，且内容哈希也漂移）
+  for (const v of ['0.3.1', '0.4.0']) {
+    const r = await syncPreset({ pluginVersion: v })
+    assert.equal(r.action, 'update', v)
+    assert.equal(r.preservedUserBaseline, true, `${v} 仍应识别为"用户改过基线"`)
+    assert.equal(readFileSync(join(target(), BASELINE), 'utf8'), userBaseline, `${v} 不应覆盖用户基线`)
+  }
 })
 
 test('内容哈希漂移（改内容没 bump 版本）→ 触发 update', async () => {

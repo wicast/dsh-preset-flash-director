@@ -55,6 +55,7 @@
       6. 有缺口：最多一次 send_message 追问（同一子代理，增量成本，指明哪条验收没过、需要补什么）。追问后仍不达标 → 停止，向用户报告分歧点，不要再次委派。
       7. 禁止专家链：专家无法再委派（工具已禁止），只能被追问一次。
       8. 会话内复用（expertReuse 默认 session）：同一会话内专家按角色（咨询/审查）复用同一子代理，连续委派自动 followup 续聊而非新建，少开 subagent、提高缓存命中；轮换与失败回落由插件自动处理，你无需干预，报告仍以 "Background subagent <id> reported:" 异步到达。
+      9. 主 pro 故障与 fallback：专家以 "Background subagent <id> failed before it finished." 结束时（模型/请求错误），插件已把那次委派退款（**本次不计额度**），并把本会话标记为主 pro 故障：下一次 expert_consult / expert_review 会自动改用 fallback 配置（若 expertFallback* 已配置）并在**新建的专家 session** 里跑（模型在建立时固定，换模型必须新建），委派结果的 `fallback` 字段说明降级详情。此时你要做的：① 直接重新委派一次（预算已退回，不必等新用户消息）；② 如实告诉用户专家模型已降级、上次尝试没花额度；③ 若未配 fallback 或 fallback 也失败，停止委派，请用户改配置或新开会话。回到主 pro 需要**新开会话**。
 
       ## 成本纪律
       - pro 输入 token 最贵：简报必须精炼——工具硬上限 40000 字符（task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000；三字段配额之和预留了头尾余量，各字段到顶时拼装后仍在 40000 内），建议 background+evidence ≤20000，只放专家真正需要的事实。
@@ -191,6 +192,15 @@
 #   - `tool-subagent-control` + `list-agents` provide send_message /
 #     interrupt_agent / list_agents, which operate on the expert children: the
 #     single bounded follow-up channel and the cancel switch.
+#   - Fallback (opt-in via the override file: expertFallbackProvider /
+#     expertFallbackModel / expertFallbackMaxTokens / expertFallbackReasoningEffort):
+#     when a delegation fails — the spawn rejects, or the child settles with a
+#     model/request error — that attempt is REFUNDED (it never counts against
+#     the budget), the primary expert model is marked down for the session, and
+#     the next delegation runs on the fallback config inside a freshly created
+#     child (a child's model is fixed at spawn, so a new session is required).
+#     Unset fallback keys = historical behaviour: the failure is reported as-is
+#     (still refunded). Going back to the primary model needs a new session.
 #
 # Raw delegation (subagent/subagent_fork/workflow/ralph) is deliberately absent:
 # a bypass channel would let the weak orchestrator route deep work to weak

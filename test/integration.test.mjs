@@ -160,6 +160,49 @@ test('POST /override 空对象移除覆盖文件', async () => {
   assert.equal(existsSync(join(presetDir, 'expert-delegation.config.json')), false)
 })
 
+test('GET /state：未配 fallback 时四键无 effective 值（opt-in，来源 default）', async () => {
+  const { payload } = await invoke(handlers['/api/flash-director/state'], 'GET')
+  for (const k of ['expertFallbackProvider', 'expertFallbackModel', 'expertFallbackMaxTokens', 'expertFallbackReasoningEffort']) {
+    assert.equal(k in payload.effective, false, k + ' 不应有默认值')
+    assert.equal(payload.source[k], 'default')
+  }
+})
+
+test('POST /override：fallback 四键可写、可读、来源 override', async () => {
+  const { status, payload } = await invoke(handlers['/api/flash-director/override'], 'POST', {
+    values: {
+      expertFallbackProvider: 'local-gateway',
+      expertFallbackModel: 'scnet/Qwen3.8-Max',
+      expertFallbackMaxTokens: 8192,
+      expertFallbackReasoningEffort: 'off',
+    },
+  })
+  assert.equal(status, 200)
+  assert.equal(payload.ok, true)
+  assert.equal(payload.effective.expertFallbackModel, 'scnet/Qwen3.8-Max')
+  assert.equal(payload.effective.expertFallbackMaxTokens, 8192)
+  // 主 pro 未覆盖 → 仍回退基线（fallback 与主 pro 配置互不影响）
+  assert.equal(payload.effective.expertModel, 'deepseek-v4-pro')
+
+  const state = await invoke(handlers['/api/flash-director/state'], 'GET')
+  assert.equal(state.payload.source.expertFallbackProvider, 'override')
+  assert.equal(state.payload.source.expertFallbackModel, 'override')
+  assert.equal(state.payload.source.expertFallbackReasoningEffort, 'override')
+  assert.deepEqual(state.payload.override.values.expertFallbackReasoningEffort, 'off')
+  // 磁盘上确实写了
+  const onDisk = JSON.parse(readFileSync(join(presetDir, 'expert-delegation.config.json'), 'utf8'))
+  assert.equal(onDisk.expertFallbackModel, 'scnet/Qwen3.8-Max')
+
+  // 非法 fallback 值被 400 拒绝
+  const bad = await invoke(handlers['/api/flash-director/override'], 'POST', { values: { expertFallbackReasoningEffort: 'ultra' } })
+  assert.equal(bad.status, 400)
+  assert.match(bad.payload.error, /expertFallbackReasoningEffort/)
+
+  // 清场：移除覆盖文件，避免影响后续用例
+  await invoke(handlers['/api/flash-director/override'], 'POST', { values: {} })
+  assert.equal(existsSync(join(presetDir, 'expert-delegation.config.json')), false)
+})
+
 test('POST /baseline：行级 patch + 备份 + 生效', async () => {
   const { status, payload } = await invoke(handlers['/api/flash-director/baseline'], 'POST', { patch: { expertModel: 'y-baseline', expertMaxTokens: 65536 } })
   assert.equal(status, 200)
@@ -224,4 +267,67 @@ test('GET /state：llm 服务缺失时 providersAvailable=false（客户端回�
   assert.equal(status, 200)
   assert.equal(payload.providersAvailable, false)
   assert.deepEqual(payload.providers, [])
+})
+
+// ── 官方设置表单 → 覆盖文件的单向镜像（含 fallback 四键）─────────────────────
+// settings.register(...).watch(next, prev) 是 fire-and-forget（回调不返回 promise），
+// 所以断言前轮询等文件落盘。
+
+async function waitForOverride(predicate, timeoutMs = 2000) {
+  const path = join(presetDir, 'expert-delegation.config.json')
+  const deadline = Date.now() + timeoutMs
+  let last
+  for (;;) {
+    try {
+      last = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      last = undefined
+    }
+    if (predicate(last)) return last
+    if (Date.now() > deadline) {
+      // 超时即失败：镜像没落盘时静默返回旧内容会让后面的断言假通过
+      throw new Error(`等待覆盖文件更新超时；当前内容 = ${JSON.stringify(last)}`)
+    }
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+
+const commitSettings = (next, prev = {}) => settingsRegistrations[0].watchers[0](next, prev)
+
+test('设置表单提交：fallback 四键镜像到覆盖文件', async () => {
+  commitSettings(
+    { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro', expertFallbackProvider: 'scnet', expertFallbackModel: 'DeepSeek-V4-Flash-0731', expertFallbackMaxTokens: 16384, expertFallbackReasoningEffort: 'low' },
+    {},
+  )
+  const onDisk = await waitForOverride((o) => o && o.expertFallbackModel === 'DeepSeek-V4-Flash-0731')
+  assert.equal(onDisk.expertFallbackProvider, 'scnet')
+  assert.equal(onDisk.expertFallbackMaxTokens, 16384)
+  assert.equal(onDisk.expertFallbackReasoningEffort, 'low')
+  // /state 也认这四键
+  const state = await invoke(handlers['/api/flash-director/state'], 'GET')
+  assert.equal(state.payload.source.expertFallbackProvider, 'override')
+  assert.equal(state.payload.effective.expertFallbackReasoningEffort, 'low')
+})
+
+test('设置表单撤回 fallback：清空即从覆盖文件移除（回到"未配 fallback"）', async () => {
+  commitSettings(
+    { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro' },
+    { expertProvider: 'opencode-go', expertModel: 'deepseek-v4-pro', expertFallbackProvider: 'scnet', expertFallbackModel: 'DeepSeek-V4-Flash-0731', expertFallbackMaxTokens: 16384, expertFallbackReasoningEffort: 'low' },
+  )
+  const onDisk = await waitForOverride((o) => o && !('expertFallbackModel' in o))
+  assert.ok(onDisk, '覆盖文件应仍存在（主键还在）')
+  for (const k of ['expertFallbackProvider', 'expertFallbackModel', 'expertFallbackMaxTokens', 'expertFallbackReasoningEffort']) {
+    assert.equal(k in onDisk, false, k + ' 应被移除')
+  }
+  assert.equal(onDisk.expertModel, 'deepseek-v4-pro')
+})
+
+test('设置表单提交：空串 fallback 值不写盘（避免"占位空串=已声明"的歧义）', async () => {
+  commitSettings({ expertModel: 'z-empty', expertFallbackProvider: '', expertFallbackModel: '' }, {})
+  const onDisk = await waitForOverride((o) => o && o.expertModel === 'z-empty')
+  assert.equal('expertFallbackProvider' in onDisk, false)
+  assert.equal('expertFallbackModel' in onDisk, false)
+  // 清场
+  await invoke(handlers['/api/flash-director/override'], 'POST', { values: {} })
+  assert.equal(existsSync(join(presetDir, 'expert-delegation.config.json')), false)
 })

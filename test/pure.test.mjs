@@ -71,6 +71,9 @@ test('readBaselineConfig 从真实 agent.cordis.yml 读出 7 键', () => {
   assert.equal(r.values.maxExpertsPerUserTask, 3)
   assert.equal(r.values.expertReuse, 'session')
   assert.equal(r.values.reuseMaxFollowups, 8)
+  // fallback 四键不在基线（只走覆盖文件）
+  assert.equal('expertFallbackModel' in r.values, false)
+  assert.equal('expertFallbackProvider' in r.values, false)
 })
 
 // ---- 行级 patch ----
@@ -154,7 +157,7 @@ test('parseScalar 处理数字/布尔/引号串/裸串', () => {
 })
 
 // ---- schema 校验 ----
-test('buildSchema 生成合法 9 键全可选 schema', async () => {
+test('buildSchema 生成合法 13 键全可选 schema', async () => {
   const z = (await import('/Applications/DSH Desktop.app/Contents/Resources/app.asar.unpacked/node_modules/@deepseek-ai/schemastery/lib/index.mjs')).default
   const schema = buildSchema(z)
   // schemastery 的 schema 可调用：合法返回解析值，非法抛 ValidationError
@@ -163,9 +166,13 @@ test('buildSchema 生成合法 9 键全可选 schema', async () => {
   assert.ok(ok({}))
   // 合法完整对象
   assert.ok(ok({ expertProvider: 'opencode-free', expertModel: 'x-preview-f-free', expertMaxTokens: 32768, expertReuse: 'session', expertReasoningEffort: 'max' }))
+  // fallback 四键
+  assert.ok(ok({ expertFallbackProvider: 'local-gateway', expertFallbackModel: 'scnet/Qwen3.8-Max', expertFallbackMaxTokens: 8192, expertFallbackReasoningEffort: 'off' }))
   // 非法枚举被拒
   assert.ok(!ok({ expertReuse: 'always' }))
   assert.ok(!ok({ expertReasoningEffort: 'ultra' }))
+  assert.ok(!ok({ expertFallbackReasoningEffort: 'ultra' }))
+  assert.ok(!ok({ expertFallbackMaxTokens: 0 }))
 })
 
 test('validateOverrideValues 拒绝未知键/非法值', () => {
@@ -173,6 +180,13 @@ test('validateOverrideValues 拒绝未知键/非法值', () => {
   assert.equal(validateOverrideValues({ nope: 1 }).ok, false)
   assert.equal(validateOverrideValues({ expertReuse: 'always' }).ok, false)
   assert.equal(validateOverrideValues({ expertMaxTokens: 0 }).ok, false)
+  // fallback 四键
+  const fb = validateOverrideValues({ expertFallbackProvider: 'local-gateway', expertFallbackModel: 'm', expertFallbackMaxTokens: 8192, expertFallbackReasoningEffort: 'off' })
+  assert.equal(fb.ok, true)
+  assert.deepEqual(fb.values, { expertFallbackProvider: 'local-gateway', expertFallbackModel: 'm', expertFallbackMaxTokens: 8192, expertFallbackReasoningEffort: 'off' })
+  assert.equal(validateOverrideValues({ expertFallbackReasoningEffort: 'ultra' }).ok, false)
+  assert.equal(validateOverrideValues({ expertFallbackMaxTokens: -1 }).ok, false)
+  assert.equal(validateOverrideValues({ expertFallbackModel: 42 }).ok, false)
   // 空值 = 不覆盖（被过滤）
   const r = validateOverrideValues({ expertModel: 'x', expertReasoningEffort: '' })
   assert.equal(r.ok, true)
@@ -183,6 +197,18 @@ test('normalizeOverride 过滤未知键与非法值', () => {
   const r = normalizeOverride({ expertModel: 'x', nope: 1, expertMaxTokens: -5 })
   assert.deepEqual(r.values, { expertModel: 'x' })
   assert.deepEqual(r.dropped, ['nope', 'expertMaxTokens'])
+})
+
+test('normalizeOverride 把空值当"未设置"静默跳过（模板里的空占位不报警）', () => {
+  const r = normalizeOverride({
+    expertFallbackProvider: '',
+    expertFallbackModel: '',
+    expertFallbackMaxTokens: '',
+    expertFallbackReasoningEffort: null,
+    expertModel: 'm',
+  })
+  assert.deepEqual(r.values, { expertModel: 'm' })
+  assert.deepEqual(r.dropped, [])
 })
 
 test('mergeEffective override > baseline > default', () => {
@@ -198,6 +224,14 @@ test('mergeEffective override > baseline > default', () => {
   // expertReasoningEffort 无默认 → 缺省
   assert.equal('expertReasoningEffort' in m3.effective, false)
   assert.equal(m3.source.expertReasoningEffort, 'default')
+  // fallback 四键无默认（opt-in）：不配即缺省，配了则来源为 override
+  for (const k of ['expertFallbackProvider', 'expertFallbackModel', 'expertFallbackMaxTokens', 'expertFallbackReasoningEffort']) {
+    assert.equal(k in m3.effective, false, k + ' 不应有默认值')
+    assert.equal(m3.source[k], 'default')
+  }
+  const m4 = mergeEffective({}, { expertFallbackModel: 'fb' })
+  assert.equal(m4.effective.expertFallbackModel, 'fb')
+  assert.equal(m4.source.expertFallbackModel, 'override')
 })
 
 // ---- 路径解析 ----
@@ -220,9 +254,30 @@ test('路径解析：FLASH_DIRECTOR_CONFIG 环境变量优先', () => {
 })
 
 test('键集合一致性', () => {
-  assert.equal(OVERRIDE_KEYS.length, 9)
+  assert.equal(OVERRIDE_KEYS.length, 13)
   assert.equal(BASELINE_KEYS.length, 7)
   for (const k of BASELINE_KEYS) assert.ok(OVERRIDE_KEYS.includes(k))
   assert.ok(!BASELINE_KEYS.includes('expertReasoningEffort'))
   assert.ok(!BASELINE_KEYS.includes('followupRetryBudget'))
+  // fallback 四键只走覆盖文件（不进基线）
+  for (const k of ['expertFallbackProvider', 'expertFallbackModel', 'expertFallbackMaxTokens', 'expertFallbackReasoningEffort']) {
+    assert.ok(OVERRIDE_KEYS.includes(k), k + ' 应在覆盖键里')
+    assert.ok(!BASELINE_KEYS.includes(k), k + ' 不应在基线键里')
+    assert.equal(k in DEFAULTS, false, k + ' 不应有内置默认（opt-in）')
+  }
+})
+
+test('示例配置模板与 OVERRIDE_KEYS 同步（防止加键后模板漂移）', () => {
+  const examplePath = join(dirname(fileURLToPath(import.meta.url)), '..', 'flash-director', 'expert-delegation.config.example.json')
+  const example = JSON.parse(readFileSync(examplePath, 'utf8'))
+  assert.deepEqual(Object.keys(example).sort(), [...OVERRIDE_KEYS].sort())
+  // 模板里的空串占位必须能被判为"未设置"（normalizeOverride 静默跳过）
+  const skipped = normalizeOverride(example)
+  assert.deepEqual(skipped.dropped, [])
+  for (const k of OVERRIDE_KEYS) {
+    if (example[k] === '') assert.equal(k in skipped.values, false, k + ' 的空串占位应为"未设置"')
+  }
+  // fallback 键在模板里默认留空 = 关闭 fallback
+  assert.equal(example.expertFallbackModel, '')
+  assert.equal(example.expertFallbackProvider, '')
 })

@@ -2,7 +2,7 @@
 
 **Flash 主控 · Pro 专家** —— DeepSeek Harness 的省 token 模式预设。
 
-> flash 级模型当主控（分诊 / 取证 / 机械执行 / 验收），深度思考类任务通过**策略工具**委派给 deepseek-v4-pro 专家子代理；简报强制校验 + 硬性预算，从机制上防止"弱智能指挥强智能"和"pro 烧钱失控"。
+> flash 级模型当主控（分诊 / 取证 / 机械执行 / 验收），深度思考类任务通过**策略工具**委派给 deepseek-v4-pro 专家子代理；简报强制校验 + 硬性预算，从机制上防止"弱智能指挥强智能"和"pro 烧钱失控"。主 pro 跑不起来时可自动降级到备用配置（`expertFallback*`，opt-in），**失败的那次委派不计额度**。
 
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![topic](https://img.shields.io/badge/topic-dsh--plugin-1f883d)](https://github.com/topics/dsh-plugin)
 
@@ -31,8 +31,8 @@
 | 文件 | 作用 |
 |---|---|
 | `flash-director/agent.cordis.yml` | 组合文件：controller persona 协议 + 行裁剪（移除裸 `subagent`/`subagent_fork`/`workflow`/`ralph`） |
-| `flash-director/expert-delegation.mjs` | 预设本地策略插件（零依赖）：`expert_consult` / `expert_review` 工具 + 简报校验 + 预算账本 + 会话内复用 + 热加载配置 |
-| `flash-director/expert-delegation.config.example.json` | 热加载覆盖配置的模板（复制为 `expert-delegation.config.json` 后编辑；不入库） |
+| `flash-director/expert-delegation.mjs` | 预设本地策略插件（零依赖）：`expert_consult` / `expert_review` 工具 + 简报校验 + 预算账本（失败退款）+ 会话内复用 + 主 pro 失败自动 fallback（新建专家 session）+ 热加载配置 |
+| `flash-director/expert-delegation.config.example.json` | 热加载覆盖配置的模板（13 键，复制为 `expert-delegation.config.json` 后编辑；不入库） |
 | `flash-director/preset.yml` | 名册元数据（名称/描述） |
 
 核心设计：**委派是默认，主控自己做深度思考是例外**。所有"深思考"工作（规划设计、架构权衡、根因分析、高风险决策、对抗性审查）只能走 `expert_consult` / `expert_review`，且专家固定跑 `deepseek-v4-pro`；主控负责读文件、跑命令、机械修改、按预写清单验证。
@@ -60,6 +60,9 @@
             │        · per-child persona：只"想"不"读"、结构化报告、必须 report
             │        · toolFilter 摘除：委派/写入/问人/后台任务/目标 等工具
             │        · 异步回报 "Background subagent <id> reported:"
+            │        · 模型/请求错误（failed before it finished）
+            │             → 那次委派退款（不计额度）+ 本会话标记主 pro 故障
+            │             → 下次委派用 expertFallback* 新建 session 跑（opt-in）
             │
             ├── expert_review(subject, content, stakes)   ← 对抗性审查（可审自己）
             │
@@ -73,6 +76,7 @@
 3. **会话内复用（默认开启）**：同一会话内按角色（咨询/审查）各复用同一子代理——连续委派经 `followup` 续聊而非重复新建，整段对话成为前缀缓存共享前缀；`reuseMaxFollowups` 轮换上限防上下文无限膨胀。**健壮性**：followup 瞬态失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING`，多为冷恢复与落盘竞态）保留条目并按 `followupRetryBudget` 有界重试、下次委派再试；permanent（`UNAUTHORIZED`/`PERSISTENCE_UNAVAILABLE`/未知错误）才清槽禁用；池为空（如 DSH 进程/插件重载后）会经 `listChildren` 按 label **收养仍存活的 child** 继续复用，而不是盲目新建。每次委派结果带 `reuseReason` 与（失败时）`followupError` 诊断字段。
 4. **禁止专家链**：专家子代理被摘除一切委派/写入工具，只能通过 `bash`/`read` 等低成本手段验证假设，不能修改工作区。
 5. **验收循环**：主控在委派**之前**写好 `acceptance` 清单，专家回报后逐项机械验证（跑测试/命令/查格式），这是"弱指挥强"的支点。
+6. **主 pro 失败 → fallback（opt-in）**：专家因"模型/请求错误"失败时（spawn 被拒，或 child 以 `stopReason: error` 结算），**那一次委派当场退款、永不计额度**；本会话标记主 pro 故障，下一次委派自动改用 `expertFallback*` 配置，并在**新建的专家 session** 里跑（child 的模型在建立时写死，换模型必须新建，不能 followup 续聊）。`aborted`（主控主动止损）/ `max-tokens` / `refusal` / `completed` 都不触发。降级是**会话级 sticky**：要回到主 pro 需新开会话。详见[主 pro 失败自动 fallback](#主-pro-失败自动-fallbackopt-in)。
 
 > **`send_message` 是独立旁路通道（软约束）**：全局 `send_message` 直接对专家 child 调 `followup`，**不计入 `reuseMaxFollowups` 轮换、也不消耗预算**。协议/persona 硬性规定每轮委派至多一次追问（"最多一次 send_message 追问"），这是行为约束而非机制强制——请勿用它无限续聊同一个专家，否则上下文膨胀防护会被绕过。`expert_consult`/`expert_review` 内部的内置续聊（复用）则严格受轮换与预算约束。
 
@@ -212,6 +216,7 @@ dsh-preset-flash-director info             # 查看安装状态
 ### 预算行为实例
 
 - 默认每用户任务 **3 次**专家委派；`expert_review(stakes: high)` 计 **2 次**；新用户消息到达自动重置。会话内复用（followup）与新建同价，轮换不额外计费。
+- **失败的委派不计额度**：spawn 被拒或 child 以模型/请求错误结算时当场退款（`stakes: high` 退 2），所以"主 pro 坏了"不会吃掉你的预算；降级后那次成功的 fallback 委派按正常价计 1 次。
 - 例：一个服务拆分任务，`design(1) + review(high, 2) = 3`，正好用满；同一任务内再想委派会被 `budget-exhausted` 拒绝，主控自行收尾并告知你。
 - 想放宽：把 `agent.cordis.yml` 里 `expert-delegation` 行的 `maxExpertsPerUserTask` 调大（见下）。
 
@@ -228,7 +233,7 @@ dsh-preset-flash-director info             # 查看安装状态
 
 ### 模型适配
 
-默认专家模型为 `deepseek-official` / `deepseek-v4-pro`。若你的部署模型 id 不同，改 `flash-director/agent.cordis.yml` 中 `expert-delegation` 行的 config（插件有同值兜底）。**运行期换模型更推荐用热加载覆盖文件**（见「配置 → 热加载覆盖配置」）：改 `expert-delegation.config.json` 的 `expertModel` 保存即生效，旧会话下一轮委派自动新建新模型子代理，不用开新会话：
+默认专家模型为 `deepseek-official` / `deepseek-v4-pro`。若你的部署模型 id 不同，改 `flash-director/agent.cordis.yml` 中 `expert-delegation` 行的 config（插件有同值兜底）。**运行期换模型更推荐用热加载覆盖文件**（见「配置 → 热加载覆盖配置」）：改 `expert-delegation.config.json` 的 `expertModel` 保存即生效，旧会话下一轮委派自动新建新模型子代理，不用开新会话。**建议同时配一个 fallback**（`expertFallbackProvider`/`expertFallbackModel`，见[主 pro 失败自动 fallback](#主-pro-失败自动-fallbackopt-in)）：主 pro 报错时自动降级，失败那次不计额度。若你的部署有多个网关，最稳的 fallback 是"换 provider、同模型"——能区分"模型有问题"还是"网关有问题"：
 
 ```yaml
 - id: expert-delegation
@@ -241,6 +246,9 @@ dsh-preset-flash-director info             # 查看安装状态
     briefMaxChars: 40000
     expertReuse: session
     reuseMaxFollowups: 8
+    # fallback（可选；插件读得到，但设置页的基线卡片只管上面 7 键 —— 建议走覆盖文件）：
+    # expertFallbackProvider: local-gateway
+    # expertFallbackModel: scnet/Qwen3.8-Max
 ```
 
 ## 配置
@@ -255,11 +263,15 @@ dsh-preset-flash-director info             # 查看安装状态
 | `reuseMaxFollowups` | `8` | 单个复用 child 的 followup 轮换上限，达到后强制新建并替换该角色的子代理（防上下文无限膨胀；轮换不额外计预算）。调大 = 更多复用/缓存命中，但单条对话更长，逼近上下文上限时会被 compaction 打断前缀——按实际简报规模调整即可 |
 | `followupRetryBudget` | `2` | 瞬态 followup 失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING`）的有界重试预算：连续失败达到上限才放弃该 child 换新建；成功即清零 |
 | `expertReasoningEffort` | `（缺省）` | 专家子代理的思考强度：`off`（关闭思考）/ `low` / `high` / `max`（逐级加大推理强度）。缺省 = 不注入，继承部署/适配器默认，零行为变化。仅作用于专家子代理（主控不受影响）；改热加载文件后该 child 下一请求即生效，不触发轮换。⚠️ 若部署禁用了 thinking，`low/high/max` 可能令专家请求报错——该场景用 `off` 或保持缺省 |
+| `expertFallbackProvider` | `（缺省=不设）` | fallback（主 pro 失败后自动降级）的 provider；留空 = 继承 `expertProvider`。与 `expertFallbackModel` **任一非空即"已声明"**；解析出的 (provider, model, maxTokens) 与主 pro 完全相同时视为未启用 |
+| `expertFallbackModel` | `（缺省=关闭）` | fallback 模型；不配 = **关闭自动降级**（历史行为，失败仍退款）。配了之后：主 pro 失败 → 下次委派用它**新建专家 session** 跑 |
+| `expertFallbackMaxTokens` | `（缺省=继承）` | fallback 的输出上限；缺省继承 `expertMaxTokens` |
+| `expertFallbackReasoningEffort` | `（缺省=继承）` | fallback 的思考强度（`off`/`low`/`high`/`max`）；缺省继承 `expertReasoningEffort`。适合"主 pro 开思考、备用模型不支持思考"这类组合 |
 | `briefMaxChars` | `40000` | 简报整体硬上限；单字段：task ≤4000、background ≤14000、evidence ≤18000、审查内容 ≤36000（字段配额之和预留头尾余量） |
 
 ### 热加载覆盖配置（不用重启 DSH，旧会话下一轮生效）
 
-上面 9 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
+上面 13 个键除了写在 `agent.cordis.yml`（会话启动时读取，新开会话生效；其中基线行只带 7 键），还可用模块同目录的 **`expert-delegation.config.json`** 在运行期热覆盖——**无需重启 DSH**，已打开的旧会话在**下一次委派**（下一次 `expert_consult`/`expert_review`）即生效。优先级：**覆盖文件 > `agent.cordis.yml` config > 内置默认**；覆盖文件缺失/畸形/删掉都安全回落。
 
 用法：
 
@@ -273,14 +285,68 @@ cp flash-director/expert-delegation.config.example.json flash-director/expert-de
 
 - **换 pro 模型**：改 `expertModel`（或 `expertProvider`/`expertMaxTokens`）后，下一轮委派会把该角色**已复用的旧 child 轮换为新建**、改用新模型（旧 child 不删除，空闲后由宿主回收）。原因：专家子代理的模型在创建时固定并持久化，平台 cold-resume 会原样重放，所以必须新建才能换模型——插件已自动处理，你只改文件即可。
 - **即时生效、不重建**：`reuseMaxFollowups`、`maxExpertsPerUserTask`、`briefMaxChars`、`expertReuse`（开/关复用）、`expertReasoningEffort`（思考强度）改后立即影响后续委派/请求，不动已有 child。
+- **换/加 fallback**：`expertFallback*` 改完下次委派即生效；已降级的会话会因指纹变化把旧 child 轮换为新建（用新 fallback 配置）。把这四个键删空 = 关闭自动降级（失败仍退款，如实报错）。
 - **定位**：默认读模块同目录（安装后即 `~/.dsh/.agent-presets/flash-director/expert-delegation.config.json`）；也可用环境变量 `FLASH_DIRECTOR_CONFIG=/path/to/file.json` 指到任意路径。
 - 该文件通常**不入库**（见 `.gitignore`），是本地运行期覆盖；`agent.cordis.yml` 仍是"默认基线"。删掉热加载文件 = 回落到基线（基线里也没配的键才回到"继承默认"）。
 
+### 主 pro 失败自动 fallback（opt-in）
+
+> 一句话：**主 pro 跑不起来（模型/请求错误）时，失败的那次委派不算额度，下一次委派自动改用你配的备用模型，并在一个新建的专家 session 里跑。**
+
+配置（不配 = 关闭，行为与历史版本完全一致；推荐走覆盖文件，改完下次委派即生效）：
+
+```jsonc
+// ~/.dsh/.agent-presets/flash-director/expert-delegation.config.json
+{
+  "expertProvider": "local-gateway",
+  "expertModel": "scnet/GLM-5.3-Flash",        // 主 pro（当前专家模型）
+  "expertFallbackProvider": "local-gateway",   // 可省：缺省继承 expertProvider
+  "expertFallbackModel": "scnet/Qwen3.8-Max",  // 备用模型（配了才启用 fallback）
+  "expertFallbackMaxTokens": 32768,            // 可省：缺省继承 expertMaxTokens
+  "expertFallbackReasoningEffort": "off"       // 可省：缺省继承 expertReasoningEffort
+}
+```
+
+规则（全部在策略插件里硬性执行）：
+
+| 事项 | 行为 |
+|---|---|
+| **触发条件** | 只有"模型/请求错误"：① spawn 直接被拒（`startContinuable` 抛错）；② child 建起来之后以 `stopReason: 'error'` 结算（模型 id 无效、provider 报错、请求被拒）。`aborted`（主控 `interrupt_agent` 止损）/ `max-tokens`（报告被截断）/ `refusal` / `completed` **都不触发** |
+| **额度** | **失败的尝试永远不计额度**：spawn 失败当场退款；child 跑起来后失败则在结算时按当时记账的 cost 退款（`stakes: high` 退 2）。退款只退"当时那一本账"——若用户已发新消息、任务边界已翻页，那笔账本就不在新任务预算里，不会退（否则等于凭空加预算） |
+| **降级方式** | 本会话（主控 agent）标记"主 pro 故障"，**sticky**：此后每次委派都用 fallback 配置。spawn 失败时还会在**同一次工具调用内**立刻新建第二个 child 用 fallback 重试一次 |
+| **为何必须新建 session** | 专家 child 的模型在 spawn 时写进 descriptor，平台 cold resume 会原样重放——换模型不能 followup 续聊。所以降级一定伴随**新建 child**（失败那个 child 的复用槽被清掉，不会被复用） |
+| **回到主 pro** | **新开一个 DSH 会话**（插件状态随会话生命周期重建）。会话内不做自动回切，避免"坏一次、切回去、再坏一次"来回烧时间 |
+| **fallback 也失败** | 同样退款、同样清槽；工具结果里 `status: "failed"` 且错误同时带主 pro 与 fallback 两条原因，并建议停止委派、请用户修配置或新开会话 |
+| **未配 fallback** | 历史行为：如实 `failed`（仍然退款，`fallback.reason: "not-configured"`），并由主控告知用户"专家模型故障、需要修配置或新开会话"。**注意**：未配 fallback 时，已标记故障的会话下一次委派仍会再试主 pro（不硬拒——很多是网关瞬时抖动，且失败照样退款、不花额度）；若连续失败，主控会停止委派并向你报告 |
+| **配了但等于主 pro** | 视为未启用（`fallback.reason: "identical-to-primary"`），不会拿同一个模型重试一遍 |
+
+主控会在委派结果的 `fallback` 字段里看到降级详情（`active` / `primaryFailure` / `refunded` / `expert` 实际模型），persona 要求它把降级与"上次不算额度"如实告诉你。示例：
+
+```json
+{
+  "status": "delegated",
+  "expert": { "provider": "local-gateway", "model": "scnet/Qwen3.8-Max", "attempt": "fallback" },
+  "budget": { "used": 1, "limit": 3, "remaining": 2 },
+  "fallback": {
+    "primaryFailed": true, "active": true, "attempt": "fallback", "newSession": true,
+    "primaryFailure": { "phase": "spawn", "code": "SPAWN_FAILED", "count": 1 },
+    "refunded": { "delegations": 1, "budget": 1 }
+  }
+}
+```
+
+边界说明：
+
+- **失败判定来自平台事件**：child 每个"驻留 epoch"结束都会发 `subagent/end`（带 `stopReason`），插件只认 `error`。罕见的**回收期故障**（宿主 `ACTIVATION_TEARDOWN_FAILED`）也会被平台记为 `error` —— 那种情况下退款是对的（这次委派确实没交付），但可能触发一次不必要的降级；新开会话即可回到主 pro。
+- **降级粒度是会话**：不同会话（不同主控 agent）各自记账，一个会话降级不影响另一个。
+- **DRAINING/NOT_RESUMABLE 等 followup 生命周期错误不算模型故障**：它们走原有的"有界重试 → 新建"路径，不触发 fallback。
+- **热加载/插件重载会重置降级状态**（进程内状态），等价于回到主 pro。
+
 ### 配置界面 + 自动部署：一个插件 = 全部
 
-**整个仓库即一个 DSH 插件（`dsh-preset-flash-director`）**，包内自带 agent 预设（`flash-director/`），加载时自动把预设同步到 `~/.dsh/.agent-presets/flash-director`（版本门 + 内容哈希：缺失安装 / 版本升级或内容变化时更新拷贝，保留你的 `expert-delegation.config.json`，检测到你改过基线就不覆盖、新版基线旁侧存放 + 警告，不降级、不覆盖无标记的手动安装），并**复用 DSH 的设置界面**给配置提供图形界面：
+**整个仓库即一个 DSH 插件（`dsh-preset-flash-director`）**，包内自带 agent 预设（`flash-director/`），加载时自动把预设同步到 `~/.dsh/.agent-presets/flash-director`（版本门 + 内容哈希：缺失安装 / 版本升级或内容变化时更新拷贝，保留你的 `expert-delegation.config.json`，检测到你改过基线就不覆盖、新版基线旁侧存放（`agent.cordis.yml.bundled-*`）+ 警告——该保护可反复生效，之后每次更新都不会覆盖你的基线，不降级、不覆盖无标记的手动安装），并**复用 DSH 的设置界面**给配置提供图形界面：
 
-- 设置侧栏新增 **「Flash 主控」** 分区页：编辑覆盖文件（9 键，保存后下次委派生效）与基线 `agent.cordis.yml`（7 键，行级 patch，新开会话生效），并显示每个键当前的生效值与来源（override/基线/默认）；Provider/模型下拉取自 DSH 现有设置（与模型选择器同源）。
+- 设置侧栏新增 **「Flash 主控」** 分区页：编辑覆盖文件（13 键，含 fallback 四键，保存后下次委派生效）与基线 `agent.cordis.yml`（7 键，行级 patch，新开会话生效），并显示每个键当前的生效值与来源（override/基线/默认）；Provider/模型下拉取自 DSH 现有设置（与模型选择器同源）。
 - 官方**插件配置**页出现 **Flash 主控 · Pro 专家** 卡片（schemastery 表单，提交后单向镜像到覆盖文件）。
 - 端点：`/api/flash-director/{state,override,baseline}`（同源校验、原子写、基线写前备份 + 写后 YAML 校验回滚）。
 
@@ -315,7 +381,11 @@ dsh-preset-flash-director uninstall           # 或 rm -rf ~/.dsh/.agent-presets
 |---|---|
 | 委派返回 `rejected` | 简报缺字段或超限：按返回信息补全/精炼 `evidence`、`background`、`acceptance` 后重试（上限见配置表） |
 | 委派返回 `budget-exhausted` | 本用户任务预算耗尽：主控自行收尾并告知用户；新消息后自动重置；或调大 `maxExpertsPerUserTask` |
-| 专家迟迟不回报 | `list_agents` 查看状态；跑飞可用 `interrupt_agent` 止损；确认模型 id 正确（无效模型会让子代理报错） |
+| 专家迟迟不回报 | `list_agents` 查看状态；跑飞可用 `interrupt_agent` 止损；确认模型 id 正确（无效模型会让子代理报错）；报错后插件会退款并（若配了 fallback）自动降级 |
+| 委派结果里出现 `fallback.active: true` | 主 pro 已失败：那次委派已退款（不计额度），本次跑在 fallback 模型（`expert.model`）的**新建 session** 上。要回主 pro → 新开会话；不想降级就把 `expertFallbackModel` 删空 |
+| 专家反复 `failed before it finished.` | 主 pro 的模型/请求错误（模型 id 无效、provider 报错）。每次失败都不计额度；修 `expertModel`/`expertProvider`，或配 `expertFallback*` 兜底；未配 fallback 时结果里 `fallback.reason: "not-configured"`，配了却与主 pro 相同则是 `"identical-to-primary"` |
+| 配了 fallback 但没降级 | 只有模型/请求错误才触发：`aborted`（你/主控止损）、`max-tokens`（报告被截断）、`refusal`、`completed` 都不算故障 |
+| 想关掉自动降级 | 覆盖文件里删掉 `expertFallbackModel`/`expertFallbackProvider`（保存即下次委派生效）；失败仍会退款，只是如实报错不再换模型 |
 | 同一会话内 `reused` 一直为 `false`（没在复用） | 先看委派结果的 `reuseReason`：`reuse` = 复用成功；`no-pool-entry` = 池空（多为 DSH 进程/插件重载后，插件会尝试按 label 收养活着的 child）；`followup-error:<CODE>` = followup 失败（`NOT_RESUMABLE`/`DRAINING`/`ACTIVATION_CLOSING` 为瞬态，插件保留条目下次重试；`UNAUTHORIZED`/`PERSISTENCE_UNAVAILABLE`/未知为永久，清槽禁用）；`config-drift` = 模型等 spawn 指纹键已变（正常轮换）；`rotation-cap` = 达到 `reuseMaxFollowups`；`followup-disabled` = 本任务内已永久失败，下条人类消息重试。`followupError` 字段给出精确错误码与重试状态 |
 | 想彻底关闭复用 | 把 `agent.cordis.yml` 里 `expert-delegation` 行的 `expertReuse` 改为 `off`（等同旧行为：每次新建子代理）；运行期可用热加载文件的 `expertReuse: "off"` 立即关闭 |
 | 改了 `expertModel` 但委派结果里 `reused` 还是 `true` | 检查覆盖文件是否被读到（路径：模块同目录 `expert-delegation.config.json` 或 `$FLASH_DIRECTOR_CONFIG`；保存后**下一次委派**才生效）；该角色旧 child 会在指纹失配时自动轮换新建——若 `reused=true` 说明指纹没变，确认改动的是 `expertModel`/`expertProvider`/`expertMaxTokens` 三键之一 |

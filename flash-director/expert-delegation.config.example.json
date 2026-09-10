@@ -7,5 +7,9 @@
   "expertReuse": "session",
   "reuseMaxFollowups": 8,
   "followupRetryBudget": 2,
-  "expertReasoningEffort": "high"
+  "expertReasoningEffort": "high",
+  "expertFallbackProvider": "",
+  "expertFallbackModel": "",
+  "expertFallbackMaxTokens": "",
+  "expertFallbackReasoningEffort": ""
 }

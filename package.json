@@ -1,7 +1,7 @@
 {
   "name": "dsh-preset-flash-director",
-  "version": "0.2.0",
-  "description": "Flash 主控 · Pro 专家 —— 一个 DSH 插件 = 配置界面（复用 DSH 设置页）+ 自动部署 agent 预设：插件加载时把打包的预设同步到 $DSH_HOME/.agent-presets/flash-director（保留用户配置），并提供设置页编辑覆盖文件与基线。",
+  "version": "0.3.0",
+  "description": "Flash 主控 · Pro 专家 —— 一个 DSH 插件 = 配置界面（复用 DSH 设置页）+ 自动部署 agent 预设：插件加载时把打包的预设同步到 $DSH_HOME/.agent-presets/flash-director（保留用户配置），并提供设置页编辑覆盖文件与基线。主 pro 失败可自动降级到 fallback 配置（opt-in），失败的委派不计额度。",
   "keywords": [
     "dsh",
     "deepseek-harness",

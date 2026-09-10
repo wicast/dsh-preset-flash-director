@@ -39,6 +39,22 @@
 // 复用健壮性：followup 瞬态失败（NOT_RESUMABLE/DRAINING/ACTIVATION_CLOSING）
 // 保留条目并按 followupRetryBudget 有界重试，permanent（UNAUTHORIZED 等）清槽
 // 禁用；池为空时按 label 经 listChildren 收养仍存活的 child（进程/模块重载后）。
+//
+// ── 主 pro 失败 → fallback（opt-in，默认关闭）──
+// 声明式配置：expertFallbackProvider / expertFallbackModel / expertFallbackMaxTokens /
+// expertFallbackReasoningEffort。任一 provider/model 非空即"已声明"；解析出的
+// (provider, model, maxTokens) 与主 pro 完全相同时视为未启用（不会静默降级）。
+// 触发条件只有"模型/请求错误"，两条路径：
+//   · spawn 抛错（startContinuable 拒绝）→ 本次不计额度（退款）→ 同一次委派调用内
+//     立刻新建一个 child 用 fallback 配置重试一次。
+//   · child 结算 stopReason === 'error'（subagent/end）→ 退款 → 标记本会话主 pro
+//     故障 → 后续委派自动改用 fallback 配置并在新建的 child session 里跑（模型在
+//     spawn 时写入 descriptor、cold resume 原样重放，换模型必须新建，不能 followup）。
+//   aborted / max-tokens / refusal / completed 一律不触发（中止多为主控主动止损）。
+// 额度规则：**失败的尝试永不计额度**（不论主 pro 还是 fallback 失败，都按当时记账
+// 的 cost 退款；账本已随新人类消息重置时不再退，因为那笔账本就不在）。
+// 降级是会话级 sticky：一旦主 pro 失败，本会话后续委派都走 fallback；回到主 pro
+// 需要新开会话（插件状态随会话生命周期重建）。
 
 // ── 热加载覆盖配置（无需重启 DSH，下次委派即生效）──
 // 优先级：`expert-delegation.config.json`（模块同目录，或 $FLASH_DIRECTOR_CONFIG
@@ -46,7 +62,8 @@
 // 每次委派解析一次（mtime 缓存省去未变时的重读）；文件缺失/畸形安全回落。
 // 改 expertProvider/expertModel/expertMaxTokens 会让既有复用 child 指纹失配
 // → 强制新建（新模型生效）；其余键（reuseMaxFollowups/maxExpertsPerUserTask/
-// briefMaxChars/expertReuse）即时生效、不触发重建。
+// briefMaxChars/expertReuse）即时生效、不触发重建。fallback 四键（expertFallback*）
+// 走同一条热加载通道：改完下次委派解析即生效；降级期间指纹按 fallback 配置计算。
 import { readFile, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -63,8 +80,16 @@ let lastConfigError = null
 
 // spawn 指纹 = 决定 child 构造的键（provider/model/maxTokens）。用 JSON 序列化
 // 避免分隔符碰撞；指纹变化 → 既有复用 child 轮换为新建（config-drift）。
-function fingerprintOf(s) {
-  return JSON.stringify([s.expertProvider, s.expertModel, s.expertMaxTokens])
+// 入参是"本次尝试配置"（attemptConfig 的产物）而非原始 settings：降级到 fallback
+// 后指纹随之改变，旧的主 pro child 自然失配轮换（换模型必须新建 session）。
+function fingerprintOf(cfg) {
+  return JSON.stringify([cfg.provider, cfg.model, cfg.maxTokens])
+}
+
+// 可选字符串键：非空字符串才算"已设置"，其余（缺省/null/空串/非字符串）一律 undefined
+// ——fallback 四键靠这个语义实现 opt-in（不配 = 关闭 fallback = 历史行为）。
+function optionalString(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
 }
 
 // followup 失败分类（依据 dsh-subagent 管理器的错误语义）：
@@ -125,6 +150,12 @@ async function resolveSettings() {
     followupRetryBudget: Number.isInteger(merged.followupRetryBudget) && merged.followupRetryBudget > 0 ? merged.followupRetryBudget : FALLBACK.followupRetryBudget,
     // 思考强度：白名单外的值（含 null/缺省）一律按 undefined 处理 → 不注入。
     expertReasoningEffort: EFFORT_VALUES.has(merged.expertReasoningEffort) ? merged.expertReasoningEffort : undefined,
+    // fallback 四键：无内置默认（opt-in）。provider/model 任一非空才算"已声明"，
+    // maxTokens/effort 缺省时继承主 pro 的对应值（见 attemptConfig）。
+    expertFallbackProvider: optionalString(merged.expertFallbackProvider),
+    expertFallbackModel: optionalString(merged.expertFallbackModel),
+    expertFallbackMaxTokens: Number.isInteger(merged.expertFallbackMaxTokens) ? merged.expertFallbackMaxTokens : undefined,
+    expertFallbackReasoningEffort: EFFORT_VALUES.has(merged.expertFallbackReasoningEffort) ? merged.expertFallbackReasoningEffort : undefined,
   }
 }
 
@@ -143,6 +174,38 @@ const FALLBACK = {
 // 专家子代理思考强度档位（经 agent/request 瀑布注入 child 的请求配置）。
 // 缺省（不在 FALLBACK 中）= undefined = 不注入 = 继承部署/适配器默认。
 const EFFORT_VALUES = new Set(['off', 'low', 'high', 'max'])
+
+// ── 本次尝试的模型配置（主 pro / fallback）──
+// useFallback=false → 主 pro（历史行为，零变化）。
+// useFallback=true  → 仅当"已声明且与主 pro 不同"时启用；否则回落主 pro，并把原因放进
+// disabledReason（not-configured / identical-to-primary）供诊断字段透出，绝不静默降级。
+function attemptConfig(s, useFallback) {
+  const primary = {
+    attempt: 'primary',
+    fallback: false,
+    provider: s.expertProvider,
+    model: s.expertModel,
+    maxTokens: s.expertMaxTokens,
+    effort: s.expertReasoningEffort,
+  }
+  if (useFallback !== true) return primary
+  const declared = s.expertFallbackProvider !== undefined || s.expertFallbackModel !== undefined
+  const provider = s.expertFallbackProvider ?? primary.provider
+  const model = s.expertFallbackModel ?? primary.model
+  const maxTokens = s.expertFallbackMaxTokens ?? primary.maxTokens
+  if (!declared || (provider === primary.provider && model === primary.model && maxTokens === primary.maxTokens)) {
+    return { ...primary, disabledReason: declared ? 'identical-to-primary' : 'not-configured' }
+  }
+  return {
+    attempt: 'fallback',
+    fallback: true,
+    provider,
+    model,
+    maxTokens,
+    // effort：fallback 专属档位优先，未设则继承主 pro 的（与 agent/request 注入钩子同规则）
+    effort: s.expertFallbackReasoningEffort ?? primary.effort,
+  }
+}
 
 // 单字段上限。evidence 是简报里最重的部分（日志、命令输出、文件摘录），
 // 给最大配额；task 是"一个认知问题"，必须保持紧凑。三个字段配额之和刻意
@@ -188,6 +251,20 @@ const pools = new Map()
 // 新建，避免每委派一次就空跑一次注定失败的 followup；下一条人类消息时清除重试。
 const followupDisabled = new Set()
 
+// ── 主 pro 失败 → fallback 的运行期状态（模块级，按 agentKey / childId 记账）──
+//   primaryDown: agentKey -> { at, count, phase, code, childId, message }
+//     本会话主 pro 已故障（会话级 sticky）：存在即"后续委派改用 fallback 配置"。
+//   pending: childId -> { agentKey, ledger, cost, role, attempt }
+//     在飞委派（child 建立那一刻登记），供 subagent/end 失败退款 + 清槽。
+//   childAttempt: childId -> 'primary' | 'fallback'
+//     child 由哪个配置起的。effort 注入钩子跑在 child 自己的插件实例（另一个 realm），
+//     只能按 childId 反查，所以这份表必须模块级共享。
+//   refundStats: agentKey -> { count, cost }，退款诊断计数。
+const primaryDown = new Map()
+const pending = new Map()
+const childAttempt = new Map()
+const refundStats = new Map()
+
 function agentKeyOf(agent) {
   return typeof agent.id === 'string' ? agent.id : String(agent.id)
 }
@@ -202,12 +279,20 @@ function setPoolSlot(agentKey, reviewer, entry) {
     pool = {}
     pools.set(agentKey, pool)
   }
-  pool[reviewer ? 'review' : 'consult'] = entry
+  const key = reviewer ? 'review' : 'consult'
+  const prev = pool[key]
+  // 槽位换人 = 旧 child 不再服务（换模型/轮换/失败），effort 表随之清理。
+  if (prev !== undefined && prev.childId !== entry.childId) childAttempt.delete(prev.childId)
+  pool[key] = entry
 }
 
 function clearPoolSlot(agentKey, reviewer) {
   const pool = pools.get(agentKey)
-  if (pool !== undefined) delete pool[reviewer ? 'review' : 'consult']
+  if (pool === undefined) return
+  const key = reviewer ? 'review' : 'consult'
+  const prev = pool[key]
+  if (prev !== undefined) childAttempt.delete(prev.childId)
+  delete pool[key]
 }
 
 function expertPersona(reviewer) {
@@ -292,6 +377,74 @@ export default {
       return entry
     }
 
+    // ── 失败退款（"这次不算额度"的唯一实现点）──
+    // 只退"当时那一本账"：账本对象在每条人类消息进入 step 时被整体替换；若当前账本已
+    // 不是记账时的那个（用户已发新消息、任务边界翻页），那笔账本就不在新任务预算里，
+    // 退回去等于凭空加预算，所以不退。
+    function refundDelegation(entry) {
+      if (!entry || entry.ledger === undefined) return false
+      if (ledgers.get(entry.agentKey) !== entry.ledger) return false
+      entry.ledger.used = Math.max(0, entry.ledger.used - entry.cost)
+      recordRefund(entry.agentKey, entry.cost)
+      return true
+    }
+
+    // 标记本会话主 pro 已故障（会话级 sticky）：此后委派一律解析为 fallback 配置。
+    function markPrimaryDown(agentKey, detail) {
+      const prev = primaryDown.get(agentKey)
+      primaryDown.set(agentKey, { at: Date.now(), count: (prev?.count ?? 0) + 1, ...detail })
+    }
+
+    // ── 主 pro 异步失败检测：child 结算 stopReason === 'error' ──
+    // 平台事实：专家 child 每个"驻留 epoch"结束（报告送达 / 报错 / 被中止）都会发一次
+    // `subagent/end`（payload = { runId, provider, id: childId, stopReason, ... }）。
+    // 该事件是 scope-filtered：`scopeTarget(service, parent)`，carrier key 就是我们在
+    // startContinuable 里传的 parent（= exec.agent 这个 agent 对象）——与本插件已在用
+    // 的 `agent/pre-step` / `agent/request` 走同一个 carrier key（`scopeTarget(agent, agent)`），
+    // 所以同一 realm 的监听器能收到（dsh-scope 的 scoped-events 表里 subagent/end 就是
+    // 受 scope 过滤的事件之一）。
+    // spawn 期失败在工具调用内就能看到（见 spawnFresh），这里兜住"child 跑起来之后才
+    // 失败"的那一半（模型 id 无效、provider 报错、请求被拒）。
+    // 只认 'error'：aborted（多为主控 interrupt 止损）/ max-tokens（报告被截断）/
+    // refusal / completed 都不算"主 pro 出问题"，既不退款也不降级。
+    // （child 自己中断而此前已记录过模型失败时，平台仍报 'error'——退款/降级成立。）
+    // child 自己的插件实例（另一个 realm）也会 apply 本模块，但 child 不能委派，
+    // 注册了只会看到无关事件——这里只在主控 realm 注册（判定与 effort 钩子同源）。
+    //
+    // 为什么按 childId 记账是安全的（复用轮 = 同一 childId 的多个 epoch）：复用场景下
+    // 每个 epoch 会各发一次 end。平台的结算顺序是 notifySettlement（唤醒主控）→
+    // observer.settle（同步 emit 'subagent/end'），而主控要跑完一整轮模型才会再次
+    // 委派；所以上一个 epoch 的 end 必然在下一个 epoch 登记 pending 之前处理完，
+    // 不会出现"迟到的旧 end 吃掉新一轮登记"。
+    const realmAgent = ctx.agent
+    const isChildRealm = !!(realmAgent && realmAgent.session && realmAgent.session.header
+      && realmAgent.session.header.parentSession !== undefined)
+    if (!isChildRealm) {
+      ctx.on('subagent/end', (info) => {
+        try {
+          const childId = info && typeof info.id === 'string' ? info.id : undefined
+          if (childId === undefined) return
+          const entry = pending.get(childId)
+          if (entry === undefined) return // 不是我们的在飞委派（或已结算过）
+          pending.delete(childId)
+          if (info.stopReason !== 'error') return
+          const refunded = refundDelegation(entry)
+          if (entry.attempt !== 'fallback') {
+            markPrimaryDown(entry.agentKey, { phase: 'settle', code: 'CHILD_ERROR', childId, provider: info.provider })
+            // 清槽 = 下次委派必定新建新 session：失败的 child 不复用，且换模型（降级）
+            // 本来就必须新建（模型写在 descriptor 里，cold resume 原样重放）。
+            clearPoolSlot(entry.agentKey, entry.role === 'review')
+          }
+          console.warn(
+            `[flash-director] expert child ${childId} (attempt=${entry.attempt}${info.provider ? ', provider=' + info.provider : ''}) `
+            + `failed before finishing: refunded=${refunded ? entry.cost : 0} (this delegation does not count against the budget)`
+          )
+        } catch {
+          /* 监听器绝不打断宿主的结算/销毁流程 */
+        }
+      })
+    }
+
     function textBlock(text) {
       return { type: 'text', text }
     }
@@ -311,27 +464,69 @@ export default {
       return { used: ledger.used, limit: s.maxExpertsPerUserTask, remaining: s.maxExpertsPerUserTask - ledger.used }
     }
 
-    function delegatedResult(childId, messageId, reviewer, ledger, s, extra) {
+    // 控制器可见的 fallback 诊断：只要本会话主 pro 已故障过，每条委派结果都带上
+    // （降级生效 / 未配置 fallback / fallback 与主 pro 相同三种形态），让"降级了"
+    // 和"该降级但没得降"都能被主控如实转述给用户，而不是静默。
+    function fallbackReport(agentKey, cfg) {
+      const down = primaryDown.get(agentKey)
+      if (down === undefined) return undefined
+      const stat = refundStats.get(agentKey) ?? { count: 0, cost: 0 }
+      const onFallback = cfg.fallback === true
+      return {
+        primaryFailed: true,
+        active: onFallback,
+        attempt: cfg.attempt,
+        reason: onFallback ? 'primary-failed' : (cfg.disabledReason ?? 'not-configured'),
+        primaryFailure: {
+          phase: down.phase,
+          code: down.code,
+          childId: down.childId ?? null,
+          count: down.count,
+          at: new Date(down.at).toISOString(),
+        },
+        // 失败的尝试一律已退款（"这次不算额度"），这里给出累计值供主控/用户核对
+        refunded: { delegations: stat.count, budget: stat.cost },
+        ...(onFallback
+          ? { provider: cfg.provider, model: cfg.model, maxTokens: cfg.maxTokens, newSession: true }
+          : {}),
+        next: onFallback
+          ? `The primary expert model failed (${down.code}); this delegation runs on the FALLBACK ${cfg.provider}/${cfg.model} in a newly created expert session, and the failed attempt was refunded — it did NOT count against the budget. Tell the user the expert model was downgraded (and that the previous attempt was free); going back to the primary model requires a NEW session.`
+          : `The primary expert model already failed in this session (${down.code}) and no usable fallback is configured (expertFallbackModel / expertFallbackProvider), so this delegation retried the SAME primary model and each failed attempt is refunded (the budget is intact). If it fails again, stop: tell the user the expert model is down and that configuring expertFallback* or opening a NEW session is the way out.`,
+      }
+    }
+
+    function delegatedResult(childId, messageId, reviewer, ledger, s, context, extra) {
       const reused = extra?.reused === true
       const roleLabel = reviewer ? 'reviewer' : 'expert'
       const next = reused
         ? `Reused this session's standing ${roleLabel} child via followup (same conversation, higher cache-hit rate). It will report asynchronously as "Background subagent <id> reported:". Verify against your acceptance checklist; at most one bounded send_message follow-up — that channel is NOT counted against reuseMaxFollowups or the budget, so keep it to one.`
         : `The expert will report asynchronously as "Background subagent <id> reported:". Verify the report against your acceptance checklist; at most one bounded follow-up via send_message (a separate channel, not counted against reuseMaxFollowups or the budget).`
+      const fallback = fallbackReport(context.agentKey, context.cfg)
       return {
         status: 'delegated',
         childId,
         messageId,
+        // 本次实际跑的专家模型（降级时与"专家模型"配置不同，便于主控/用户核对）
+        expert: {
+          provider: context.cfg.provider,
+          model: context.cfg.model,
+          maxTokens: context.cfg.maxTokens,
+          attempt: context.cfg.attempt,
+        },
         budget: budgetInfo(ledger, s),
         next,
         // 覆盖文件畸形/非法时把诊断带给控制器，避免"改了没生效"却无信号
         ...(lastConfigError !== null ? { configError: lastConfigError } : {}),
+        ...(fallback !== undefined ? { fallback } : {}),
         ...extra,
       }
     }
 
     // 会话内复用决策。返回 'followup'（复用该 child）或 'spawn'（新建）。
-    // s 是本次委派解析的一次性有效配置快照（含热覆盖）。
-    function decideReuse(reviewer, agentKey, s) {
+    // s 是本次委派解析的一次性有效配置快照（含热覆盖）；cfg 是本次尝试的模型配置
+    // （主 pro / fallback），指纹按 cfg 算——降级后与旧主 pro child 自动失配
+    // （config-drift）→ 新建新 session 跑 fallback。
+    function decideReuse(reviewer, agentKey, s, cfg) {
       if (s.expertReuse !== 'session') return { action: 'spawn', reason: 'reuse-off' }
       if (followupDisabled.has(agentKey)) return { action: 'spawn', reason: 'followup-disabled' }
       const entry = poolSlot(agentKey, reviewer)
@@ -341,7 +536,7 @@ export default {
       if (entry.adopted === true) return { action: 'followup', entry, reason: 'adopted' }
       // 配置漂移：spawn 指纹键（provider/model/maxTokens）变了 → 旧 child 的
       // 模型已过时，清槽新建（与 followupDisabled 语义无关，只是轮换）。
-      if (entry.fingerprint !== fingerprintOf(s)) {
+      if (entry.fingerprint !== fingerprintOf(cfg)) {
         clearPoolSlot(agentKey, reviewer)
         return { action: 'spawn', reason: 'config-drift' }
       }
@@ -394,10 +589,31 @@ export default {
       }
     }
 
-    // 新建一个专家子代理（fresh spawn）。preserveSlot=true 时（瞬态失败后回落的
-    // 一次性 spawn）不写池槽——被保留的旧 child 留给下一次委派重试，本委派的新
-    // child 是一次性的，空闲后由宿主回收。meta: { reuseReason, followupError? }。
-    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost, s, meta, preserveSlot) {
+    function errorText(error) {
+      return String(error && error.message ? error.message : error)
+    }
+
+    function recordRefund(agentKey, cost) {
+      const stat = refundStats.get(agentKey) ?? { count: 0, cost: 0 }
+      refundStats.set(agentKey, { count: stat.count + 1, cost: stat.cost + cost })
+    }
+
+    // 把新建成功的 child 登记为该角色的标准 child（指纹按本次尝试配置算）。
+    function poolNewChild(agentKey, reviewer, childId, cfg) {
+      setPoolSlot(agentKey, reviewer, {
+        childId,
+        followups: 0,
+        fingerprint: fingerprintOf(cfg),
+        retries: 0,
+        adopted: false,
+      })
+    }
+
+    // 一次 spawn 尝试：记账 → startContinuable → 登记在飞委派（供失败退款/降级）。
+    // cfg = 本次尝试的模型配置（主 pro / fallback）。失败当场退款（本次不计额度）
+    // 并把错误交回 spawnFresh 决定是否改用 fallback 再试。
+    async function attemptSpawn(cfg, reviewer, brief, parent, exec, ledger, cost) {
+      const agentKey = agentKeyOf(parent)
       ledger.used += cost
       try {
         const started = await ctx.subagents.startContinuable({
@@ -409,33 +625,97 @@ export default {
             prompt: [textBlock(brief)],
             parent,
             agentOptions: {
-              provider: s.expertProvider,
-              model: s.expertModel,
-              maxTokens: s.expertMaxTokens,
+              provider: cfg.provider,
+              model: cfg.model,
+              maxTokens: cfg.maxTokens,
             },
             persona: expertPersona(reviewer),
             toolFilter: { deny: DENY_TOOLS },
           },
           signal: exec.signal,
         })
-        if (preserveSlot !== true) {
-          setPoolSlot(agentKeyOf(parent), reviewer, {
-            childId: started.childId,
-            followups: 0,
-            fingerprint: fingerprintOf(s),
-            retries: 0,
-            adopted: false,
-          })
-        }
-        return delegatedResult(started.childId, started.messageId, reviewer, ledger, s, { reused: false, cost, ...meta })
+        // 在飞登记：该 child 之后若以 stopReason='error' 结算，subagent/end 依此
+        // 退款 + 降级；childAttempt 供 effort 注入钩子按 childId 反查尝试类型。
+        pending.set(started.childId, {
+          agentKey,
+          ledger,
+          cost,
+          role: reviewer ? 'review' : 'consult',
+          attempt: cfg.attempt,
+        })
+        childAttempt.set(started.childId, cfg.attempt)
+        return { ok: true, childId: started.childId, messageId: started.messageId }
       } catch (error) {
         ledger.used -= cost
-        return { status: 'failed', error: String(error && error.message ? error.message : error) }
+        recordRefund(agentKey, cost)
+        return { ok: false, error }
+      }
+    }
+
+    // 新建一个专家子代理（fresh spawn）。preserveSlot=true 时（瞬态失败后回落的
+    // 一次性 spawn）不写池槽——被保留的旧 child 留给下一次委派重试，本委派的新
+    // child 是一次性的，空闲后由宿主回收。meta: { reuseReason, followupError? }。
+    //
+    // 失败语义（fallback，opt-in）：
+    //   · 本次尝试先按"主 pro 或已降级的 fallback"配置起 child，spawn 抛错当场退款。
+    //   · 主 pro 抛错 → 标记本会话主 pro 故障 + 清槽，并在同一次委派内再新建一个
+    //     child 用 fallback 配置重试一次（换模型必须新建 session，不能 followup）。
+    //   · 成功的 fallback child 成为该角色的标准 child（写池槽，指纹按 fallback 算），
+    //     后续委派在降级状态下继续复用/轮换它。
+    async function spawnFresh(reviewer, brief, parent, exec, ledger, cost, s, meta, preserveSlot) {
+      const agentKey = agentKeyOf(parent)
+      const cfg = attemptConfig(s, primaryDown.has(agentKey))
+      const first = await attemptSpawn(cfg, reviewer, brief, parent, exec, ledger, cost)
+      if (first.ok) {
+        if (preserveSlot !== true) poolNewChild(agentKey, reviewer, first.childId, cfg)
+        return delegatedResult(first.childId, first.messageId, reviewer, ledger, s, { agentKey, cfg }, { reused: false, cost, ...meta })
+      }
+
+      const firstError = errorText(first.error)
+      if (cfg.attempt === 'primary') {
+        // 主 pro 失败：本次不计额度（attemptSpawn 已退款）→ 本会话标记故障 →
+        // 清槽：失败的 child 不复用，下次委派必定新建新 session。
+        markPrimaryDown(agentKey, { phase: 'spawn', code: 'SPAWN_FAILED', message: firstError })
+        clearPoolSlot(agentKey, reviewer)
+      }
+
+      const fb = attemptConfig(s, true)
+      if (fb.fallback !== true) {
+        // 未配置（或与主 pro 完全相同）fallback：保持历史行为——如实报错，但已退款。
+        return {
+          status: 'failed',
+          error: firstError,
+          refunded: true,
+          fallback: {
+            attempted: false,
+            reason: fb.disabledReason ?? 'not-configured',
+            hint: 'This attempt was refunded (it does not count against the budget). Configure expertFallbackProvider / expertFallbackModel via the override file to get automatic fallback, or open a new session to retry the primary model.',
+          },
+        }
+      }
+
+      const second = await attemptSpawn(fb, reviewer, brief, parent, exec, ledger, cost)
+      if (second.ok) {
+        if (preserveSlot !== true) poolNewChild(agentKey, reviewer, second.childId, fb)
+        return delegatedResult(second.childId, second.messageId, reviewer, ledger, s, { agentKey, cfg: fb }, { reused: false, cost, ...meta })
+      }
+      const secondError = errorText(second.error)
+      return {
+        status: 'failed',
+        error: `primary failed: ${firstError} | fallback (${fb.provider}/${fb.model}) failed: ${secondError}`,
+        refunded: true,
+        fallback: {
+          attempted: true,
+          provider: fb.provider,
+          model: fb.model,
+          error: secondError,
+          hint: 'Both the primary and the fallback expert models failed; both attempts were refunded. Tell the user and stop delegating until the model configuration is fixed or a new session is opened.',
+        },
       }
     }
 
     // 统一委派入口：解析有效配置 → 预算闸门 → （可选）收养找回 → 复用决策
-    // → followup 优先、失败按分类回落新建。
+    // → followup 优先、失败按分类回落新建（新建路径里主 pro 抛错会自动降级 fallback）。
     // s 由调用方（工具 execute）解析一次并下传，保证一次委派内键一致。
     async function spawnExpert(args, reviewer, exec, s) {
       const parent = exec.agent
@@ -457,11 +737,17 @@ export default {
       }
 
       // 池空且复用开启：尝试按 label 收养仍存活的 child（进程/模块重载后）。
-      if (s.expertReuse === 'session' && !followupDisabled.has(agentKey) && poolSlot(agentKey, reviewer) === undefined) {
+      // 主 pro 已故障时不收养：那条通道会把刚刚失败的旧 primary child 找回来复用
+      // （降级要求"新建 session"，收养正好相反）——直接走新建 + fallback 配置。
+      if (s.expertReuse === 'session' && !primaryDown.has(agentKey)
+        && !followupDisabled.has(agentKey) && poolSlot(agentKey, reviewer) === undefined) {
         await adoptExistingChild(agentKey, reviewer, parent, exec)
       }
 
-      const decision = decideReuse(reviewer, agentKey, s)
+      // 本次委派用的模型配置：主 pro，或（本会话主 pro 已故障时）fallback。
+      const cfg = attemptConfig(s, primaryDown.has(agentKey))
+
+      const decision = decideReuse(reviewer, agentKey, s, cfg)
       if (decision.action === 'followup') {
         ledger.used += cost
         const outcome = await attemptFollowup(decision.entry, brief, parent, exec, s.followupRetryBudget)
@@ -469,9 +755,18 @@ export default {
           // 收养条目一次性吸附后固化：指纹以当前配置为准，后续受 config-drift 约束。
           if (decision.entry.adopted === true) {
             decision.entry.adopted = false
-            decision.entry.fingerprint = fingerprintOf(s)
+            decision.entry.fingerprint = fingerprintOf(cfg)
           }
-          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, s, {
+          // 复用这一轮的失败也要能被检出：登记在飞委派（该 child 若以 error 结算，
+          // 同样退款 + 降级 + 清槽）。attempt 取它建立时的配置（指纹已校验一致）。
+          pending.set(outcome.childId, {
+            agentKey,
+            ledger,
+            cost,
+            role: reviewer ? 'review' : 'consult',
+            attempt: cfg.attempt,
+          })
+          return delegatedResult(outcome.childId, outcome.messageId, reviewer, ledger, s, { agentKey, cfg }, {
             reused: true,
             cost,
             reuseReason: decision.reason,
@@ -479,6 +774,8 @@ export default {
         }
         // followup 失败：退款；CANCELLED 原样透出；transient 保留条目有界重试，
         // permanent 清槽 + 本任务禁用；预算不重复扣（spawn 路径重新记账）。
+        // 注意：这是生命周期错误（NOT_RESUMABLE 等），不是模型故障——不计入退款统计、
+        // 也不触发 fallback（换模型要新建，由 spawn 路径决定）。
         ledger.used -= cost
         if (outcome.cls.cancelled) throw outcome.error
         const willRetry = outcome.cls.transient && (decision.entry.retries || 0) < s.followupRetryBudget
@@ -502,7 +799,7 @@ export default {
 
     const consult = {
       name: 'expert_consult',
-      description: 'Delegate ONE bounded cognitive task to a pro-model expert (deepseek-v4-pro). This is the ONLY channel for deep-thinking work — planning, design, root-cause analysis, high-risk decisions — which you must never attempt yourself. The tool enforces the delegation protocol: a complete curated brief is mandatory, and a hard budget of 3 expert delegations per user task applies (reset on each new user message; expert_review with stakes "high" costs 2). In the default session-reuse mode the delegation reuses this session\'s standing expert child via followup (fewer subagents, higher provider cache-hit rate) instead of spawning a fresh one; rotation and failure fallback are automatic.\n\nMANDATORY before calling: 1) gather evidence first (read files, run commands, search) — an empty evidence section is rejected; 2) task = exactly ONE cognitive question, not an operation; 3) acceptance = a mechanically verifiable checklist written BEFORE delegating; 4) curate context — oversized briefs are rejected, never dump whole files or the conversation.\n\nThe expert reports asynchronously ("Background subagent <id> reported:"), cannot write files, and cannot delegate. Verify the report against your acceptance checklist with tests/commands; at most one bounded follow-up via send_message. If the budget is exhausted the tool refuses — finish with your best effort and tell the user.',
+      description: 'Delegate ONE bounded cognitive task to a pro-model expert (deepseek-v4-pro). This is the ONLY channel for deep-thinking work — planning, design, root-cause analysis, high-risk decisions — which you must never attempt yourself. The tool enforces the delegation protocol: a complete curated brief is mandatory, and a hard budget of 3 expert delegations per user task applies (reset on each new user message; expert_review with stakes "high" costs 2). In the default session-reuse mode the delegation reuses this session\'s standing expert child via followup (fewer subagents, higher provider cache-hit rate) instead of spawning a fresh one; rotation is automatic. A FAILED attempt never counts against the budget: if the spawn rejects or the child settles with a model/request error, that delegation is refunded, the primary expert model is marked down for this session, and the plugin switches to the configured fallback model (expertFallback*, when configured) in a NEWLY created expert session — check the result\'s "fallback" field and tell the user about the downgrade. When a child ends with "Background subagent <id> failed before it finished.", simply delegate once more (the refunded budget is available) instead of giving up; if it keeps failing, stop and tell the user to fix the model configuration or open a new session. Going back to the primary model requires a new session.\n\nMANDATORY before calling: 1) gather evidence first (read files, run commands, search) — an empty evidence section is rejected; 2) task = exactly ONE cognitive question, not an operation; 3) acceptance = a mechanically verifiable checklist written BEFORE delegating; 4) curate context — oversized briefs are rejected, never dump whole files or the conversation.\n\nThe expert reports asynchronously ("Background subagent <id> reported:"), cannot write files, and cannot delegate. Verify the report against your acceptance checklist with tests/commands; at most one bounded follow-up via send_message. If the budget is exhausted the tool refuses — finish with your best effort and tell the user.',
       parameters: {
         type: 'object',
         properties: {
@@ -544,7 +841,7 @@ export default {
 
     const review = {
       name: 'expert_review',
-      description: 'Ask a pro-model expert (deepseek-v4-pro) to ADVERSARIALLY REVIEW material — your own design, plan, diff, or another expert\'s output. Use this for the meta-cognition loop: high-risk or complex deliverables get checked by a stronger model before you ship them. Costs 1 budget slot, or 2 with stakes "high" (irreversible changes: schema, migration, security). In the default session-reuse mode the review reuses this session\'s standing reviewer child via followup. The review report arrives asynchronously like expert_consult and must be verified the same way: read every blocking issue, apply the must-fix list, and only proceed once the verdict is 通过 (or the user overrides).',
+      description: 'Ask a pro-model expert (deepseek-v4-pro) to ADVERSARIALLY REVIEW material — your own design, plan, diff, or another expert\'s output. Use this for the meta-cognition loop: high-risk or complex deliverables get checked by a stronger model before you ship them. Costs 1 budget slot, or 2 with stakes "high" (irreversible changes: schema, migration, security). In the default session-reuse mode the review reuses this session\'s standing reviewer child via followup. Failed attempts are refunded the same way as expert_consult (a model/request error marks the primary expert model down for this session and switches to the configured fallback in a newly created expert session). The review report arrives asynchronously like expert_consult and must be verified the same way: read every blocking issue, apply the must-fix list, and only proceed once the verdict is 通过 (or the user overrides).',
       parameters: {
         type: 'object',
         properties: {
@@ -576,7 +873,7 @@ export default {
     ctx.tools.register(consult)
     ctx.tools.register(review)
 
-    // ── 专家子代理思考强度（expertReasoningEffort）──
+    // ── 专家子代理思考强度（expertReasoningEffort / expertFallbackReasoningEffort）──
     // 平台事实：agent-loop buildRequest 只从会话持久化 header 读 reasoningEffort、
     // 不读 this.options.reasoningEffort，所以 spawn 时塞进 agentOptions 无效；唯一
     // 覆盖请求配置的插件扩展点是 agent/request 瀑布。child（continuable 子代理）无
@@ -584,6 +881,9 @@ export default {
     // next() 再注入，保证任何上游（如未来某处的模型选择）已落定。判定只用本 ctx
     // 自身 agent（agent-scoped ctx 的 own property；waterfall payload 不带 agent）：
     // parentSession 存在即专家子代理；主控（顶层会话）无 parentSession、不受影响。
+    // 档位选择：本 child 是 fallback 起的话优先用 expertFallbackReasoningEffort，
+    // 未设则继承主 pro 档位（与 attemptConfig 同规则）——childAttempt 是模块级，
+    // 跨 realm 可见（钩子跑在 child 自己的插件实例里，只能按 childId 反查）。
     // 改动不参与 spawn 指纹 → 切换档位热生效、不轮换 child；非法值由 resolveSettings
     // 降级为 undefined（不注入）；钩子自身绝不因我们的逻辑破坏专家轮次。
     ctx.on('agent/request', async (payload, next) => {
@@ -593,9 +893,12 @@ export default {
         const isChild = !!(agent && agent.session && agent.session.header && agent.session.header.parentSession !== undefined)
         if (!isChild) return resolved
         const s = await resolveSettings()
-        if (s.expertReasoningEffort === undefined) return resolved
+        const effort = childAttempt.get(agent.id) === 'fallback' && s.expertFallbackReasoningEffort !== undefined
+          ? s.expertFallbackReasoningEffort
+          : s.expertReasoningEffort
+        if (effort === undefined) return resolved
         const { reasoningEffort: _inherited, ...rest } = resolved
-        return { ...rest, reasoningEffort: s.expertReasoningEffort }
+        return { ...rest, reasoningEffort: effort }
       } catch {
         return resolved // 我们自己的任何异常都不改变请求配置
       }
